@@ -1,0 +1,10 @@
+{
+  "name": "@mini-canvas/livesync-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "read": "node --experimental-strip-types src/cli.ts read",
+    "test": "node --experimental-strip-types tests/all.test.ts"
+  }
+}
