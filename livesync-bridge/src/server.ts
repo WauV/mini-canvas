@@ -2,9 +2,17 @@ import { timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 
-import { LiveSyncBridge, RevisionConflictError } from "./bridge.ts";
+import {
+  AttachmentTooLargeError,
+  LiveSyncBridge,
+  RevisionConflictError,
+} from "./bridge.ts";
 import type { BridgeServerConfig } from "./config.ts";
 import { CouchDbHttpError } from "./couchdb.ts";
+import type {
+  ListVaultEntriesInput,
+  VaultEntryKind,
+} from "./types.ts";
 
 const MAX_JSON_BYTES = 2 * 1024 * 1024;
 
@@ -21,6 +29,20 @@ function sendJson(
     "X-Content-Type-Options": "nosniff",
   });
   response.end(body);
+}
+
+function sendBytes(
+  response: ServerResponse,
+  value: Uint8Array,
+  headers: Record<string, string>,
+): void {
+  response.writeHead(200, {
+    "Cache-Control": "no-store",
+    "Content-Length": String(value.byteLength),
+    "X-Content-Type-Options": "nosniff",
+    ...headers,
+  });
+  response.end(Buffer.from(value));
 }
 
 function tokenMatches(header: string | undefined, expected: string): boolean {
@@ -56,6 +78,32 @@ function requireString(body: Record<string, unknown>, key: string): string {
   return value;
 }
 
+function optionalString(body: Record<string, unknown>, key: string): string | undefined {
+  const value = body[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") throw new Error(`字段 ${key} 必须是字符串`);
+  return value;
+}
+
+function optionalInteger(body: Record<string, unknown>, key: string): number | undefined {
+  const value = body[key];
+  if (value === undefined) return undefined;
+  if (!Number.isInteger(value)) throw new Error(`字段 ${key} 必须是整数`);
+  return value as number;
+}
+
+function optionalStringArray(
+  body: Record<string, unknown>,
+  key: string,
+): string[] | undefined {
+  const value = body[key];
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error(`字段 ${key} 必须是字符串数组`);
+  }
+  return value as string[];
+}
+
 function routeNotFound(response: ServerResponse): void {
   sendJson(response, 404, { error: "not_found" });
 }
@@ -63,6 +111,7 @@ function routeNotFound(response: ServerResponse): void {
 export function createBridgeHttpServer(
   bridge: LiveSyncBridge,
   authToken: string,
+  maxAttachmentBytes = 20 * 1024 * 1024,
 ): Server {
   if (!authToken) throw new Error("Bridge HTTP 服务不能使用空认证令牌");
 
@@ -103,8 +152,60 @@ export function createBridgeHttpServer(
         return;
       }
 
+      if (url.pathname === "/v1/entries/list") {
+        const kinds = optionalStringArray(body, "kinds") as
+          | VaultEntryKind[]
+          | undefined;
+        const input: ListVaultEntriesInput = {
+          cursor: optionalString(body, "cursor"),
+          prefix: optionalString(body, "prefix"),
+          kinds,
+          extensions: optionalStringArray(body, "extensions"),
+          limit: optionalInteger(body, "limit"),
+        };
+        sendJson(response, 200, await bridge.listEntries(input));
+        return;
+      }
+
+      if (url.pathname === "/v1/changes/poll") {
+        sendJson(
+          response,
+          200,
+          await bridge.pollChanges({
+            since: requireString(body, "since"),
+            limit: optionalInteger(body, "limit"),
+            timeoutMs: optionalInteger(body, "timeoutMs"),
+          }),
+        );
+        return;
+      }
+
+      if (url.pathname === "/v1/attachments/read") {
+        const attachment = await bridge.readAttachment(
+          requireString(body, "path"),
+          maxAttachmentBytes,
+        );
+        sendBytes(response, attachment.bytes, {
+          "Content-Type": attachment.mimeType,
+          "ETag": `"${attachment.revision}"`,
+          "X-Mini-Canvas-Path": encodeURIComponent(attachment.path),
+          "X-Mini-Canvas-Revision": attachment.revision,
+          "X-Mini-Canvas-Ctime": String(attachment.ctime),
+          "X-Mini-Canvas-Mtime": String(attachment.mtime),
+        });
+        return;
+      }
+
       routeNotFound(response);
     } catch (error) {
+      if (error instanceof AttachmentTooLargeError) {
+        sendJson(response, 413, {
+          error: "attachment_too_large",
+          size: error.size,
+          maximum: error.maximum,
+        });
+        return;
+      }
       if (error instanceof RevisionConflictError) {
         sendJson(response, 409, {
           error: "revision_conflict",
@@ -121,7 +222,10 @@ export function createBridgeHttpServer(
         sendJson(response, 400, { error: "invalid_request" });
         return;
       }
-      if (error instanceof Error && /字段|请求|JSON|路径|必须/u.test(error.message)) {
+      if (
+        error instanceof Error &&
+        /字段|请求|JSON|路径|必须|列表|变更|附件|Base64|大小校验/u.test(error.message)
+      ) {
         sendJson(response, 400, { error: "invalid_request", message: error.message });
         return;
       }
@@ -134,7 +238,11 @@ export function createBridgeHttpServer(
 export async function startBridgeHttpServer(
   config: BridgeServerConfig,
 ): Promise<Server> {
-  const server = createBridgeHttpServer(new LiveSyncBridge(config), config.authToken);
+  const server = createBridgeHttpServer(
+    new LiveSyncBridge(config),
+    config.authToken,
+    config.maxAttachmentBytes,
+  );
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(config.port, config.host, () => {

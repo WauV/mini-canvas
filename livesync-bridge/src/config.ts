@@ -15,6 +15,7 @@ export type BridgeServerConfig = BridgeConfig & {
   host: "127.0.0.1";
   port: number;
   authToken: string;
+  maxAttachmentBytes: number;
 };
 
 function parseEnvFile(path: string): Record<string, string> {
@@ -82,11 +83,18 @@ export function loadBridgeServerConfig(
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new Error("LIVESYNC_BRIDGE_PORT 必须是 1 到 65535 之间的整数");
   }
+  const maxAttachmentBytes = Number(
+    liveSync.LIVESYNC_BRIDGE_MAX_ATTACHMENT_BYTES ?? String(20 * 1024 * 1024),
+  );
+  if (!Number.isInteger(maxAttachmentBytes) || maxAttachmentBytes < 1) {
+    throw new Error("LIVESYNC_BRIDGE_MAX_ATTACHMENT_BYTES 必须是正整数");
+  }
 
   return {
     ...loadBridgeConfig(projectRoot),
     host: "127.0.0.1",
     port,
     authToken: requireValue(liveSync, "LIVESYNC_BRIDGE_TOKEN"),
+    maxAttachmentBytes,
   };
 }

@@ -39,6 +39,61 @@ export type NoteSnapshot = {
   children: string[];
 };
 
+export type VaultEntryKind = "note" | "attachment";
+
+export type VaultEntrySummary = {
+  path: string;
+  kind: VaultEntryKind;
+  mimeType: string;
+  revision: string;
+  ctime: number;
+  mtime: number;
+  size: number;
+};
+
+export type ListVaultEntriesInput = {
+  cursor?: string;
+  limit?: number;
+  prefix?: string;
+  kinds?: VaultEntryKind[];
+  extensions?: string[];
+};
+
+export type ListVaultEntriesResult = {
+  entries: VaultEntrySummary[];
+  nextCursor?: string;
+  baselineSequence: string;
+};
+
+export type VaultChangeEvent = {
+  sequence: string;
+  documentId: string;
+  path: string;
+  kind: VaultEntryKind;
+  operation: "upsert" | "delete";
+  revision?: string;
+  ctime?: number;
+  mtime?: number;
+  size?: number;
+  mimeType: string;
+};
+
+export type VaultChangeBatch = {
+  events: VaultChangeEvent[];
+  nextSequence: string;
+  pending: number;
+};
+
+export type AttachmentSnapshot = {
+  path: string;
+  bytes: Uint8Array;
+  mimeType: string;
+  revision: string;
+  ctime: number;
+  mtime: number;
+  size: number;
+};
+
 export type CommitNoteInput = {
   path: string;
   content: string;

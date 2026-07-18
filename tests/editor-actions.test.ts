@@ -66,6 +66,21 @@ test("inserts a numbered footnote without reformatting the document", () => {
   );
 });
 
+test("preserves CRLF line endings when appending a footnote", () => {
+  const source = "第一行\r\n第二行";
+  const result = applyEditorAction(
+    source,
+    source.length,
+    source.length,
+    "footnote",
+  );
+
+  assert.equal(
+    result.value,
+    "第一行\r\n第二行[^1]\r\n\r\n[^1]: 脚注内容",
+  );
+});
+
 test("uses the next available numeric footnote id", () => {
   const source = "已有[^1]\n\n[^1]: 第一条";
   const result = applyEditorAction(source, 2, 2, "footnote");

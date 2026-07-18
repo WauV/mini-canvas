@@ -148,6 +148,11 @@ function nextFootnoteId(value: string): string {
   return String(highestId + 1);
 }
 
+function preferredLineEnding(value: string): "\n" | "\r\n" {
+  const firstLineEnding = value.match(/\r\n|\n/u)?.[0];
+  return firstLineEnding === "\r\n" ? "\r\n" : "\n";
+}
+
 function createFootnote(
   value: string,
   start: number,
@@ -158,11 +163,12 @@ function createFootnote(
   const selected = value.slice(start, end);
   const withReference =
     value.slice(0, start) + selected + reference + value.slice(end);
-  const separator = withReference.endsWith("\n\n")
+  const lineEnding = preferredLineEnding(value);
+  const separator = withReference.endsWith(lineEnding + lineEnding)
     ? ""
-    : withReference.endsWith("\n")
-      ? "\n"
-      : "\n\n";
+    : withReference.endsWith(lineEnding)
+      ? lineEnding
+      : lineEnding + lineEnding;
   const definition = "[^" + id + "]: 脚注内容";
   const nextValue = withReference + separator + definition;
   const selectionStart =

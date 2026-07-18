@@ -6,6 +6,7 @@ export type TextRange = {
 export type ObsidianTokenKind =
   | "frontmatter"
   | "code-block"
+  | "svg-block"
   | "block-math"
   | "table"
   | "callout"
@@ -57,12 +58,21 @@ export type ParsedObsidianMarkdown = {
 
 function getLines(source: string): MarkdownLine[] {
   const lines: MarkdownLine[] = [];
-  let from = 0;
+  let lineStart = 0;
 
-  for (const text of source.split("\n")) {
-    const to = from + text.length;
-    lines.push({ from, to, text });
-    from = to + 1;
+  for (let cursor = 0; cursor <= source.length; cursor += 1) {
+    const character = source[cursor];
+    const atEnd = cursor === source.length;
+    if (!atEnd && character !== "\n" && character !== "\r") continue;
+
+    lines.push({
+      from: lineStart,
+      to: cursor,
+      text: source.slice(lineStart, cursor),
+    });
+
+    if (character === "\r" && source[cursor + 1] === "\n") cursor += 1;
+    lineStart = cursor + 1;
   }
 
   return lines;
@@ -121,16 +131,28 @@ function splitTableRow(line: string): string[] {
   let cell = "";
   for (let index = 0; index < source.length; index += 1) {
     const character = source[index];
-    if (
-      character === "\\" &&
-      source[index + 1] === "|" &&
-      !isEscapedAt(source, index)
-    ) {
-      cell += "|";
-      index += 1;
+    if (character === "\\") {
+      let runEnd = index;
+      while (source[runEnd] === "\\") runEnd += 1;
+      const backslashCount = runEnd - index;
+
+      if (source[runEnd] === "|") {
+        cell += "\\".repeat(Math.floor(backslashCount / 2));
+        if (backslashCount % 2 === 1) {
+          cell += "|";
+        } else {
+          cells.push(cell.trim());
+          cell = "";
+        }
+        index = runEnd;
+        continue;
+      }
+
+      cell += "\\".repeat(backslashCount);
+      index = runEnd - 1;
       continue;
     }
-    if (character === "|" && !isEscapedAt(source, index)) {
+    if (character === "|") {
       cells.push(cell.trim());
       cell = "";
       continue;
@@ -194,24 +216,84 @@ function parseBlockTokens(
         ? lines[closingIndex]
         : lines[lines.length - 1];
       const range = { from: line.from, to: closing.to };
+      const language = fenceMatch[2].trim().split(/\s+/u, 1)[0].toLowerCase();
+      const isSvg = hasClosingFence && language === "svg";
+      const contentFrom = lines[index + 1]?.from ?? line.to;
+      const contentTo = hasClosingFence
+        ? closingIndex > index + 1
+          ? lines[closingIndex - 1].to
+          : contentFrom
+        : closing.to;
       tokens.push({
-        kind: "code-block",
+        kind: isSvg ? "svg-block" : "code-block",
         ...range,
-        contentFrom: line.to + 1,
-        contentTo: hasClosingFence
-          ? Math.max(line.to + 1, closing.from - 1)
-          : closing.to,
+        contentFrom,
+        contentTo,
         markerRanges: hasClosingFence
           ? [
               { from: line.from, to: line.to },
               { from: closing.from, to: closing.to },
             ]
           : [{ from: line.from, to: line.to }],
-        data: { language: fenceMatch[2].trim() },
+        data: {
+          language,
+          ...(isSvg
+            ? {
+                svg: lines
+                  .slice(index + 1, closingIndex)
+                  .map((item) => item.text)
+                  .join("\n"),
+                svgFormat: "fence",
+              }
+            : {}),
+        },
       });
       protectedRanges.push(range);
       index = hasClosingFence ? closingIndex : lines.length - 1;
       continue;
+    }
+
+    const svgOpening = line.text.match(/^\s*<svg(?:\s|>)/iu);
+    if (svgOpening) {
+      const openingOffset = line.text.search(/<svg(?:\s|>)/iu);
+      let closingIndex = index;
+      let closingMatch = lines[closingIndex].text.match(/<\/svg\s*>/iu);
+
+      while (!closingMatch && closingIndex + 1 < lines.length) {
+        closingIndex += 1;
+        closingMatch = lines[closingIndex].text.match(/<\/svg\s*>/iu);
+      }
+
+      if (closingMatch) {
+        const closingLine = lines[closingIndex];
+        const closingEnd = (closingMatch.index ?? 0) + closingMatch[0].length;
+        const trailingSource = closingLine.text.slice(closingEnd);
+
+        if (trailingSource.trim().length === 0) {
+          const svg = lines
+            .slice(index, closingIndex + 1)
+            .map((item, lineIndex, blockLines) => {
+              if (lineIndex === 0 && lineIndex === blockLines.length - 1) {
+                return item.text.slice(openingOffset, closingEnd);
+              }
+              if (lineIndex === 0) return item.text.slice(openingOffset);
+              if (lineIndex === blockLines.length - 1) {
+                return item.text.slice(0, closingEnd);
+              }
+              return item.text;
+            })
+            .join("\n");
+          const range = { from: line.from, to: closingLine.to };
+          tokens.push({
+            kind: "svg-block",
+            ...range,
+            data: { svg, svgFormat: "inline" },
+          });
+          protectedRanges.push(range);
+          index = closingIndex;
+          continue;
+        }
+      }
     }
 
     const sameLineMath = line.text.match(/^\s*\$\$(.+?)\$\$\s*$/);
@@ -245,8 +327,11 @@ function parseBlockTokens(
         tokens.push({
           kind: "block-math",
           ...range,
-          contentFrom: line.to + 1,
-          contentTo: Math.max(line.to + 1, closing.from - 1),
+          contentFrom: lines[index + 1].from,
+          contentTo:
+            closingIndex > index + 1
+              ? lines[closingIndex - 1].to
+              : lines[index + 1].from,
           data: { latex },
         });
         protectedRanges.push(range);
@@ -306,6 +391,8 @@ function parseLineTokens(
     );
     if (calloutMatch) {
       let closingIndex = index + 1;
+      // The separator whitespace belongs to the visual marker replacement so
+      // the title starts flush after the widget's own margin.
       const openingMarkerTo =
         line.from +
         calloutMatch[1].length +
@@ -511,6 +598,26 @@ function parseInlineTokens(
   }
 
   const patterns: InlinePattern[] = [
+    // Inline code must claim its range before links or other Markdown syntax.
+    // Obsidian treats everything between the matching backticks as literal.
+    {
+      kind: "inline-code",
+      expression: /(\x60+)([^\x60\n]+?)\1/g,
+      getToken: (match, from) => ({
+        kind: "inline-code",
+        from,
+        to: from + match[0].length,
+        contentFrom: from + match[1].length,
+        contentTo: from + match[0].length - match[1].length,
+        markerRanges: [
+          { from, to: from + match[1].length },
+          {
+            from: from + match[0].length - match[1].length,
+            to: from + match[0].length,
+          },
+        ],
+      }),
+    },
     {
       kind: "wiki-link",
       expression: /(!?)\[\[([^\]\n]+)\]\]/g,
@@ -571,24 +678,6 @@ function parseInlineTokens(
         from,
         to: from + match[0].length,
         data: { id: match[1] },
-      }),
-    },
-    {
-      kind: "inline-code",
-      expression: /(\x60+)([^\x60\n]+?)\1/g,
-      getToken: (match, from) => ({
-        kind: "inline-code",
-        from,
-        to: from + match[0].length,
-        contentFrom: from + match[1].length,
-        contentTo: from + match[0].length - match[1].length,
-        markerRanges: [
-          { from, to: from + match[1].length },
-          {
-            from: from + match[0].length - match[1].length,
-            to: from + match[0].length,
-          },
-        ],
       }),
     },
     {

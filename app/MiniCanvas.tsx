@@ -5,6 +5,11 @@ import { Editor, type EditorMode } from "./components/Editor";
 import { calculateDocumentStatistics } from "./lib/document-statistics";
 import { LocalStorageDocumentRepository } from "./lib/documents/local-storage-repository";
 import {
+  McpDraftDocumentRepository,
+  titleFromVaultPath,
+} from "./lib/documents/mcp-draft-repository";
+import { DocumentSaveQueue } from "./lib/documents/save-queue";
+import {
   createDocumentSnapshot,
   createIdempotencyKey,
   DEFAULT_DOCUMENT_ID,
@@ -12,12 +17,21 @@ import {
   type DocumentRepository,
   type DocumentSnapshot,
 } from "./lib/documents/types";
+import {
+  type CommitPreview,
+  type DraftSnapshot,
+  McpRevisionConflictError,
+  MiniCanvasMcpClient,
+  type VaultNoteEntry,
+} from "./lib/mcp/mini-canvas-client";
+import { createMcpToolClient } from "./lib/mcp/tool-client";
 
 type SaveState = "saved" | "saving" | "error" | "conflict";
 type SaveConflict = {
   expectedVersion: string;
   actualVersion: string;
 };
+type McpNotice = { kind: "info" | "error" | "success"; text: string };
 
 const INLINE_CODE = String.fromCharCode(96);
 const CODE_FENCE = INLINE_CODE.repeat(3);
@@ -67,6 +81,18 @@ const EXAMPLE_MARKDOWN = [
   "\\end{bmatrix}",
   "$$",
   "",
+  "## SVG 图形",
+  "",
+  "下面的源码仍保存在笔记中，Live Preview 会把它显示为安全的图片预览：",
+  "",
+  CODE_FENCE + "svg",
+  '<svg viewBox="0 0 360 120" role="img" aria-label="Mini Canvas SVG 示例">',
+  '  <rect width="360" height="120" rx="24" fill="#f4e2d6" />',
+  '  <circle cx="64" cy="60" r="28" fill="#d97757" />',
+  '  <path d="M112 60 H308" stroke="#75422f" stroke-width="8" stroke-linecap="round" />',
+  "</svg>",
+  CODE_FENCE,
+  "",
   "## 表格",
   "",
   "| 功能 | 状态 |",
@@ -103,20 +129,53 @@ function hasMeaningfulContent(document: DocumentSnapshot): boolean {
   );
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "MCP 草稿操作失败";
+}
+
 export function MiniCanvas() {
   const [document, setDocument] = useState<DocumentSnapshot>(INITIAL_DOCUMENT);
   const [editorMode, setEditorMode] = useState<EditorMode>("live");
   const [saveState, setSaveState] = useState<SaveState>("saved");
   const [saveConflict, setSaveConflict] = useState<SaveConflict | null>(null);
+  const [resolvingConflict, setResolvingConflict] = useState(false);
   const [hasRecovery, setHasRecovery] = useState(false);
   const [ready, setReady] = useState(false);
+  const [mcpDraft, setMcpDraft] = useState<DraftSnapshot | null>(null);
+  const [vaultNotes, setVaultNotes] = useState<VaultNoteEntry[]>([]);
+  const [notePickerOpen, setNotePickerOpen] = useState(false);
+  const [noteQuery, setNoteQuery] = useState("");
+  const [notesLoaded, setNotesLoaded] = useState(false);
+  const [mcpBusy, setMcpBusy] = useState(false);
+  const [mcpNotice, setMcpNotice] = useState<McpNotice | null>(null);
+  const [commitPreview, setCommitPreview] = useState<CommitPreview | null>(null);
   const repositoryRef = useRef<DocumentRepository | null>(null);
+  const localRepositoryRef = useRef<LocalStorageDocumentRepository | null>(null);
+  const mcpRepositoryRef = useRef<McpDraftDocumentRepository | null>(null);
+  const mcpClientRef = useRef<MiniCanvasMcpClient | null>(null);
   const documentRef = useRef(document);
   const versionRef = useRef(document.version);
+  const saveConflictRef = useRef<SaveConflict | null>(null);
+  const saveQueueRef = useRef(new DocumentSaveQueue());
+  const conflictResolutionInFlightRef = useRef(false);
+  const persistedContentRef = useRef<{
+    title: string;
+    content: string;
+  } | null>(null);
 
   useEffect(() => {
     documentRef.current = document;
   }, [document]);
+
+  const updateSaveConflict = useCallback((conflict: SaveConflict | null) => {
+    saveConflictRef.current = conflict;
+    setSaveConflict(conflict);
+  }, []);
+
+  const getMcpClient = useCallback((): MiniCanvasMcpClient => {
+    mcpClientRef.current ??= new MiniCanvasMcpClient(createMcpToolClient());
+    return mcpClientRef.current;
+  }, []);
 
   const persistSnapshot = useCallback(
     async (
@@ -132,13 +191,17 @@ export function MiniCanvas() {
             idempotencyKey: createIdempotencyKey(),
           },
         );
+        persistedContentRef.current = {
+          title: pendingDocument.title,
+          content: pendingDocument.content,
+        };
         versionRef.current = savedDocument.version;
         setDocument((current) => ({
           ...current,
           version: savedDocument.version,
           updatedAt: savedDocument.updatedAt,
         }));
-        setSaveConflict(null);
+        updateSaveConflict(null);
 
         const current = documentRef.current;
         if (
@@ -149,7 +212,7 @@ export function MiniCanvas() {
         }
       } catch (error: unknown) {
         if (error instanceof DocumentConflictError) {
-          setSaveConflict({
+          updateSaveConflict({
             expectedVersion: error.expectedVersion,
             actualVersion: error.actualVersion,
           });
@@ -159,12 +222,45 @@ export function MiniCanvas() {
         }
       }
     },
-    [],
+    [updateSaveConflict],
+  );
+
+  const enqueuePersist = useCallback(
+    (
+      repository: DocumentRepository,
+      options: {
+        expectedVersion?: string;
+        pendingDocument?: DocumentSnapshot;
+        resolveConflict?: boolean;
+      } = {},
+    ): Promise<void> =>
+      saveQueueRef.current.run(async () => {
+        if (saveConflictRef.current && !options.resolveConflict) return;
+
+        const pendingDocument = options.pendingDocument ?? documentRef.current;
+        const persistedContent = persistedContentRef.current;
+        if (
+          !options.resolveConflict &&
+          persistedContent?.title === pendingDocument.title &&
+          persistedContent.content === pendingDocument.content
+        ) {
+          setSaveState("saved");
+          return;
+        }
+
+        await persistSnapshot(
+          repository,
+          pendingDocument,
+          options.expectedVersion ?? versionRef.current,
+        );
+      }),
+    [persistSnapshot],
   );
 
   useEffect(() => {
     let active = true;
     const repository = new LocalStorageDocumentRepository(window.localStorage);
+    localRepositoryRef.current = repository;
     repositoryRef.current = repository;
 
     void Promise.all([
@@ -173,6 +269,9 @@ export function MiniCanvas() {
     ]).then(([storedDocument, recovery]) => {
       if (!active) return;
       const initialDocument = storedDocument ?? INITIAL_DOCUMENT;
+      persistedContentRef.current = storedDocument
+        ? { title: storedDocument.title, content: storedDocument.content }
+        : null;
       versionRef.current = initialDocument.version;
       setDocument(initialDocument);
       setHasRecovery(recovery !== null);
@@ -184,52 +283,246 @@ export function MiniCanvas() {
     };
   }, []);
 
+  useEffect(
+    () => () => {
+      mcpClientRef.current?.close();
+    },
+    [],
+  );
+
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || saveConflict) return;
     const repository = repositoryRef.current;
     if (!repository) return;
 
     const pendingDocument = documentRef.current;
+    const persistedContent = persistedContentRef.current;
+    if (
+      persistedContent?.title === pendingDocument.title &&
+      persistedContent.content === pendingDocument.content
+    ) {
+      setSaveState("saved");
+      return;
+    }
     const timer = window.setTimeout(() => {
-      const expectedVersion = versionRef.current;
-      void persistSnapshot(repository, pendingDocument, expectedVersion);
+      void enqueuePersist(repository);
     }, 320);
 
     return () => window.clearTimeout(timer);
-  }, [document.content, document.title, persistSnapshot, ready]);
+  }, [document.content, document.title, enqueuePersist, ready, saveConflict]);
 
   const statistics = useMemo(
     () => calculateDocumentStatistics(document.content),
     [document.content],
   );
 
+  const filteredVaultNotes = useMemo(() => {
+    const query = noteQuery.trim().toLocaleLowerCase("zh-CN");
+    if (!query) return vaultNotes;
+    return vaultNotes.filter((entry) =>
+      entry.path.toLocaleLowerCase("zh-CN").includes(query),
+    );
+  }, [noteQuery, vaultNotes]);
+
+  const showNotePicker = () => {
+    setNotePickerOpen(true);
+    setMcpNotice(null);
+    if (notesLoaded || mcpBusy) return;
+
+    setMcpBusy(true);
+    void getMcpClient()
+      .listNotes()
+      .then((entries) => {
+        setVaultNotes(entries);
+        setNotesLoaded(true);
+      })
+      .catch((error: unknown) => {
+        setMcpNotice({ kind: "error", text: errorMessage(error) });
+      })
+      .finally(() => setMcpBusy(false));
+  };
+
+  const openVaultNote = async (
+    path: string,
+    options: { skipConfirmation?: boolean } = {},
+  ): Promise<void> => {
+    if (mcpBusy) return;
+    const current = { ...documentRef.current, version: versionRef.current };
+    if (
+      !options.skipConfirmation &&
+      hasMeaningfulContent(current) &&
+      !window.confirm(
+        "打开 Obsidian 笔记会切换当前编辑器。当前本地内容会进入恢复槽，MCP 草稿会先保存，是否继续？",
+      )
+    ) {
+      return;
+    }
+
+    setMcpBusy(true);
+    setMcpNotice({ kind: "info", text: "正在创建加密草稿…" });
+    try {
+      const currentMcpRepository = mcpRepositoryRef.current;
+      if (currentMcpRepository) {
+        await enqueuePersist(currentMcpRepository);
+        if (saveConflictRef.current) {
+          throw new Error("请先解决当前草稿的保存冲突");
+        }
+      } else if (hasMeaningfulContent(current)) {
+        await localRepositoryRef.current?.backup(current);
+        setHasRecovery(true);
+      }
+
+      const client = getMcpClient();
+      const draft = await client.createDraft(path);
+      const repository = new McpDraftDocumentRepository({
+        client,
+        draft,
+        recovery: localRepositoryRef.current ??
+          new LocalStorageDocumentRepository(window.localStorage),
+        onDraftChange: setMcpDraft,
+      });
+      const nextDocument: DocumentSnapshot = {
+        id: draft.id,
+        title: titleFromVaultPath(draft.path),
+        content: draft.content,
+        version: String(draft.version),
+        updatedAt: draft.updatedAt,
+      };
+
+      repositoryRef.current = repository;
+      mcpRepositoryRef.current = repository;
+      versionRef.current = nextDocument.version;
+      documentRef.current = nextDocument;
+      persistedContentRef.current = {
+        title: nextDocument.title,
+        content: nextDocument.content,
+      };
+      setDocument(nextDocument);
+      setMcpDraft(draft);
+      setCommitPreview(null);
+      updateSaveConflict(null);
+      setSaveState("saved");
+      setEditorMode("live");
+      setNotePickerOpen(false);
+      setMcpNotice({
+        kind: "success",
+        text: `已打开加密草稿 · ${draft.path}`,
+      });
+    } catch (error) {
+      setMcpNotice({ kind: "error", text: errorMessage(error) });
+    } finally {
+      setMcpBusy(false);
+    }
+  };
+
+  const previewMcpCommit = async (): Promise<void> => {
+    const repository = mcpRepositoryRef.current;
+    if (!repository || mcpBusy || mcpDraft?.status !== "active") return;
+
+    setMcpBusy(true);
+    setMcpNotice({ kind: "info", text: "正在保存草稿并生成提交预览…" });
+    try {
+      await enqueuePersist(repository);
+      if (saveConflictRef.current) throw new Error("请先解决草稿保存冲突");
+      const preview = await repository.previewCommit(versionRef.current);
+      setCommitPreview(preview);
+      setMcpNotice({
+        kind: preview.changed ? "info" : "success",
+        text: preview.changed ? "提交预览已生成" : "当前草稿没有需要提交的变化",
+      });
+    } catch (error) {
+      setMcpNotice({ kind: "error", text: errorMessage(error) });
+    } finally {
+      setMcpBusy(false);
+    }
+  };
+
+  const commitCurrentMcpDraft = async (): Promise<void> => {
+    const repository = mcpRepositoryRef.current;
+    if (!repository || !commitPreview || !commitPreview.changed || mcpBusy) return;
+    if (commitPreview.version !== Number(versionRef.current)) {
+      setCommitPreview(null);
+      setMcpNotice({ kind: "error", text: "草稿已经变化，请重新生成提交预览" });
+      return;
+    }
+
+    setMcpBusy(true);
+    setMcpNotice({ kind: "info", text: "正在安全提交到 Obsidian…" });
+    try {
+      const result = await repository.commit(
+        versionRef.current,
+        createIdempotencyKey(),
+      );
+      versionRef.current = String(result.draft.version);
+      const nextDocument = {
+        ...documentRef.current,
+        version: String(result.draft.version),
+        updatedAt: result.draft.updatedAt,
+      };
+      documentRef.current = nextDocument;
+      setDocument(nextDocument);
+      setMcpDraft(result.draft);
+      setCommitPreview(null);
+      setSaveState("saved");
+      setMcpNotice({
+        kind: "success",
+        text: `已提交到 Obsidian · revision ${result.note.revision}`,
+      });
+    } catch (error) {
+      setMcpNotice({
+        kind: "error",
+        text:
+          error instanceof McpRevisionConflictError
+            ? "Obsidian 笔记已经变化；草稿仍然安全保留，未覆盖新内容"
+            : errorMessage(error),
+      });
+    } finally {
+      setMcpBusy(false);
+    }
+  };
+
   const replaceDocument = async (
     title: string,
     content: string,
     confirmation: string,
   ) => {
-    const repository = repositoryRef.current;
     const current = {
       ...documentRef.current,
       version: versionRef.current,
     };
 
-    if (repository && hasMeaningfulContent(current)) {
-      if (!window.confirm(confirmation)) return;
+    // If there is an active MCP draft and the user is switching away, save it
+    // first or warn that it will be abandoned.
+    const activeMcpRepository = mcpRepositoryRef.current;
+    if (activeMcpRepository) {
+      await enqueuePersist(activeMcpRepository);
+      if (saveConflictRef.current) {
+        setMcpNotice({ kind: "error", text: "请先解决当前草稿的保存冲突再切换" });
+        return;
+      }
+    }
+
+    const repository = localRepositoryRef.current ?? repositoryRef.current;
+
+    let storedDocument: DocumentSnapshot | null = null;
+    if (repository) {
+      const shouldBackup = hasMeaningfulContent(current);
+      if (shouldBackup && !window.confirm(confirmation)) return;
 
       try {
-        await repository.backup(current);
-        setHasRecovery(true);
+        storedDocument = await repository.load(DEFAULT_DOCUMENT_ID);
+        if (shouldBackup) {
+          await repository.backup(current);
+          setHasRecovery(true);
+        }
       } catch {
         setSaveState("error");
         return;
       }
     }
-
-    const storedDocument = repository
-      ? await repository.load(DEFAULT_DOCUMENT_ID)
-      : null;
     const expectedVersion = storedDocument?.version ?? versionRef.current;
+    if (repository) repositoryRef.current = repository;
+    mcpRepositoryRef.current = null;
     versionRef.current = expectedVersion;
 
     setDocument((latest) => ({
@@ -239,7 +532,10 @@ export function MiniCanvas() {
       version: expectedVersion,
       updatedAt: Date.now(),
     }));
-    setSaveConflict(null);
+    updateSaveConflict(null);
+    setMcpDraft(null);
+    setCommitPreview(null);
+    setMcpNotice(null);
     setEditorMode("live");
     setSaveState("saving");
   };
@@ -261,52 +557,68 @@ export function MiniCanvas() {
   };
 
   const restoreRecovery = () => {
-    const repository = repositoryRef.current;
+    const repository = localRepositoryRef.current;
     if (!repository) return;
 
-    void repository.loadRecovery().then(async (recovery) => {
-      if (!recovery) {
-        setHasRecovery(false);
-        return;
-      }
+    void (async () => {
+      try {
+        const recovery = await repository.loadRecovery();
+        if (!recovery) {
+          setHasRecovery(false);
+          return;
+        }
 
-      if (
-        hasMeaningfulContent(documentRef.current) &&
-        !window.confirm("用恢复版本替换当前内容？当前版本会进入恢复槽。")
-      ) {
-        return;
-      }
+        if (
+          hasMeaningfulContent(documentRef.current) &&
+          !window.confirm("用恢复版本替换当前内容？当前版本会进入恢复槽。")
+        ) {
+          return;
+        }
 
-      const current = {
-        ...documentRef.current,
-        version: versionRef.current,
-      };
-      await repository.backup(current);
-      const storedDocument = await repository.load(DEFAULT_DOCUMENT_ID);
-      const expectedVersion = storedDocument?.version ?? "0";
-      versionRef.current = expectedVersion;
-      setDocument((latest) => ({
-        ...latest,
-        title: recovery.title,
-        content: recovery.content,
-        version: expectedVersion,
-        updatedAt: Date.now(),
-      }));
-      setEditorMode("live");
-      setSaveState("saving");
-      setSaveConflict(null);
-      setHasRecovery(true);
-    });
+        const current = {
+          ...documentRef.current,
+          version: versionRef.current,
+        };
+        const storedDocument = await repository.load(DEFAULT_DOCUMENT_ID);
+        const expectedVersion = storedDocument?.version ?? "0";
+        await repository.backup(current);
+        versionRef.current = expectedVersion;
+        repositoryRef.current = repository;
+        mcpRepositoryRef.current = null;
+        setDocument((latest) => ({
+          ...latest,
+          title: recovery.title,
+          content: recovery.content,
+          version: expectedVersion,
+          updatedAt: Date.now(),
+        }));
+        setEditorMode("live");
+        setSaveState("saving");
+        updateSaveConflict(null);
+        setMcpDraft(null);
+        setCommitPreview(null);
+        setHasRecovery(true);
+      } catch {
+        setSaveState("error");
+      }
+    })();
   };
 
   const updateTitle = (title: string) => {
-    setDocument((current) => ({ ...current, title }));
-    setSaveState("saving");
+    if (mcpDraft) return;
+    const next = { ...documentRef.current, title };
+    documentRef.current = next;
+    setDocument(next);
+    setSaveState(saveConflictRef.current ? "conflict" : "saving");
   };
 
   const updateContent = (content: string) => {
-    setDocument((current) => ({ ...current, content }));
-    setSaveState("saving");
+    if (mcpDraft?.status !== undefined && mcpDraft.status !== "active") return;
+    const next = { ...documentRef.current, content };
+    documentRef.current = next;
+    setDocument(next);
+    setCommitPreview(null);
+    setSaveState(saveConflictRef.current ? "conflict" : "saving");
   };
 
   const overwriteStoredVersion = () => {
@@ -314,6 +626,7 @@ export function MiniCanvas() {
     if (
       !repository ||
       !saveConflict ||
+      conflictResolutionInFlightRef.current ||
       !window.confirm(
         "保留编辑器中的当前内容，并覆盖浏览器里较新的已保存版本？",
       )
@@ -321,9 +634,11 @@ export function MiniCanvas() {
       return;
     }
 
-    void repository
-      .load(DEFAULT_DOCUMENT_ID)
-      .then(async (latest) => {
+    conflictResolutionInFlightRef.current = true;
+    setResolvingConflict(true);
+    void (async () => {
+      try {
+        const latest = await repository.load(DEFAULT_DOCUMENT_ID);
         if (!latest) throw new Error("找不到已保存版本。");
         versionRef.current = latest.version;
         const pending = {
@@ -334,11 +649,19 @@ export function MiniCanvas() {
           ...current,
           version: latest.version,
         }));
-        setSaveConflict(null);
         setSaveState("saving");
-        await persistSnapshot(repository, pending, latest.version);
-      })
-      .catch(() => setSaveState("error"));
+        await enqueuePersist(repository, {
+          expectedVersion: latest.version,
+          pendingDocument: pending,
+          resolveConflict: true,
+        });
+      } catch {
+        setSaveState("error");
+      } finally {
+        conflictResolutionInFlightRef.current = false;
+        setResolvingConflict(false);
+      }
+    })();
   };
 
   const loadStoredVersion = () => {
@@ -346,6 +669,7 @@ export function MiniCanvas() {
     if (
       !repository ||
       !saveConflict ||
+      conflictResolutionInFlightRef.current ||
       !window.confirm(
         "载入浏览器中已经保存的版本？当前编辑器内容会先放入恢复槽。",
       )
@@ -353,25 +677,41 @@ export function MiniCanvas() {
       return;
     }
 
-    void repository
-      .load(DEFAULT_DOCUMENT_ID)
-      .then(async (latest) => {
+    conflictResolutionInFlightRef.current = true;
+    setResolvingConflict(true);
+    void (async () => {
+      try {
+        const latest = await repository.load(DEFAULT_DOCUMENT_ID);
         if (!latest) throw new Error("找不到已保存版本。");
         await repository.backup({
           ...documentRef.current,
           version: versionRef.current,
         });
         versionRef.current = latest.version;
+        persistedContentRef.current = {
+          title: latest.title,
+          content: latest.content,
+        };
         setDocument(latest);
         setHasRecovery(true);
-        setSaveConflict(null);
+        updateSaveConflict(null);
         setSaveState("saved");
-      })
-      .catch(() => setSaveState("error"));
+      } catch {
+        setSaveState("error");
+      } finally {
+        conflictResolutionInFlightRef.current = false;
+        setResolvingConflict(false);
+      }
+    })();
   };
 
   const saveLabels: Record<SaveState, string> = {
-    saved: "已保存到本机",
+    saved:
+      mcpDraft?.status === "committed"
+        ? "已提交到 Obsidian"
+        : mcpDraft
+          ? "已保存到加密草稿"
+          : "已保存到本机",
     saving: "正在保存",
     error: "保存失败",
     conflict: "保存冲突",
@@ -395,8 +735,10 @@ export function MiniCanvas() {
           <input
             value={document.title}
             onChange={(event) => updateTitle(event.target.value)}
+            readOnly={Boolean(mcpDraft)}
             placeholder="未命名笔记"
             aria-label="文档标题"
+            title={mcpDraft?.path}
           />
         </label>
 
@@ -422,6 +764,7 @@ export function MiniCanvas() {
                 className="conflict-action"
                 type="button"
                 onClick={overwriteStoredVersion}
+                disabled={resolvingConflict}
               >
                 保留当前
               </button>
@@ -429,6 +772,7 @@ export function MiniCanvas() {
                 className="conflict-action"
                 type="button"
                 onClick={loadStoredVersion}
+                disabled={resolvingConflict}
               >
                 载入已保存
               </button>
@@ -451,11 +795,19 @@ export function MiniCanvas() {
             新建
           </button>
           <button
-            className="primary-button"
+            className="secondary-button header-action-example"
             type="button"
             onClick={loadExample}
           >
             示例
+          </button>
+          <button
+            className="primary-button"
+            type="button"
+            onClick={showNotePicker}
+            disabled={mcpBusy}
+          >
+            打开笔记
           </button>
         </div>
       </header>
@@ -482,8 +834,35 @@ export function MiniCanvas() {
         <div className="view-bar-meta">
           <p>
             <span aria-hidden="true">◇</span>
-            Obsidian Markdown · 原文保真
+            {mcpDraft
+              ? `${mcpDraft.path} · 草稿 v${mcpDraft.version}`
+              : "Obsidian Markdown · 本地预览"}
           </p>
+          {mcpDraft ? (
+            <div className="mcp-draft-actions" aria-label="MCP 草稿操作">
+              {mcpDraft.status === "active" ? (
+                <button
+                  type="button"
+                  className="draft-action"
+                  onClick={() => void previewMcpCommit()}
+                  disabled={mcpBusy || Boolean(saveConflict)}
+                >
+                  预览提交
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="draft-action"
+                  onClick={() =>
+                    void openVaultNote(mcpDraft.path, { skipConfirmation: true })
+                  }
+                  disabled={mcpBusy}
+                >
+                  继续编辑
+                </button>
+              )}
+            </div>
+          ) : null}
           <div className="document-stats" aria-label="文档统计">
             <span>{statistics.lines} 行</span>
             <span>{statistics.words} 字词</span>
@@ -500,8 +879,142 @@ export function MiniCanvas() {
           content={document.content}
           mode={editorMode}
           onChange={updateContent}
+          readOnly={mcpDraft?.status === "committed" || mcpDraft?.status === "expired"}
         />
       </section>
+
+      {mcpNotice ? (
+        <div className={`mcp-notice mcp-notice-${mcpNotice.kind}`} role="status">
+          <span>{mcpNotice.text}</span>
+          <button type="button" onClick={() => setMcpNotice(null)} aria-label="关闭提示">
+            ×
+          </button>
+        </div>
+      ) : null}
+
+      {notePickerOpen ? (
+        <div className="dialog-backdrop" role="presentation">
+          <section
+            className="canvas-dialog note-picker-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="note-picker-title"
+          >
+            <header className="dialog-header">
+              <div>
+                <span className="dialog-eyebrow">MCP · 隔离 Vault</span>
+                <h2 id="note-picker-title">打开 Obsidian 笔记</h2>
+              </div>
+              <button
+                type="button"
+                className="dialog-close"
+                onClick={() => setNotePickerOpen(false)}
+                aria-label="关闭笔记列表"
+              >
+                ×
+              </button>
+            </header>
+            <label className="note-search-field">
+              <span className="sr-only">筛选笔记路径</span>
+              <input
+                value={noteQuery}
+                onChange={(event) => setNoteQuery(event.target.value)}
+                placeholder="搜索文件夹或笔记名称…"
+                autoFocus
+              />
+            </label>
+            <div className="note-picker-meta">
+              <span>{mcpBusy && !notesLoaded ? "正在读取…" : `${filteredVaultNotes.length} 篇笔记`}</span>
+              <span>打开时创建加密草稿，不直接改写 Obsidian</span>
+            </div>
+            <div className="note-list" role="list">
+              {filteredVaultNotes.map((entry) => (
+                <button
+                  type="button"
+                  className="note-list-item"
+                  role="listitem"
+                  key={entry.path}
+                  onClick={() => void openVaultNote(entry.path)}
+                  disabled={mcpBusy}
+                >
+                  <span className="note-list-name">{titleFromVaultPath(entry.path)}</span>
+                  <span className="note-list-path">{entry.path}</span>
+                  <span className="note-list-size">
+                    {Math.max(1, Math.round(entry.size / 1024))} KB
+                  </span>
+                </button>
+              ))}
+              {!mcpBusy && notesLoaded && filteredVaultNotes.length === 0 ? (
+                <p className="note-list-empty">没有找到匹配的 Markdown 笔记。</p>
+              ) : null}
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {commitPreview ? (
+        <div className="dialog-backdrop" role="presentation">
+          <section
+            className="canvas-dialog commit-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="commit-preview-title"
+          >
+            <header className="dialog-header">
+              <div>
+                <span className="dialog-eyebrow">提交前确认</span>
+                <h2 id="commit-preview-title">写回 Obsidian</h2>
+              </div>
+              <button
+                type="button"
+                className="dialog-close"
+                onClick={() => setCommitPreview(null)}
+                aria-label="关闭提交预览"
+              >
+                ×
+              </button>
+            </header>
+            <dl className="commit-summary">
+              <div>
+                <dt>笔记</dt>
+                <dd>{commitPreview.path}</dd>
+              </div>
+              <div>
+                <dt>字符变化</dt>
+                <dd>{commitPreview.characterDelta >= 0 ? "+" : ""}{commitPreview.characterDelta}</dd>
+              </div>
+              <div>
+                <dt>行数变化</dt>
+                <dd>{commitPreview.lineDelta >= 0 ? "+" : ""}{commitPreview.lineDelta}</dd>
+              </div>
+              <div>
+                <dt>基线 revision</dt>
+                <dd>{commitPreview.baseRevision}</dd>
+              </div>
+            </dl>
+            <p className="commit-hash">
+              内容摘要 · {commitPreview.contentSha256.slice(0, 16)}…
+            </p>
+            <div className="dialog-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => setCommitPreview(null)}
+              >
+                返回编辑
+              </button>
+              <button
+                type="button"
+                className="primary-button"
+                onClick={() => void commitCurrentMcpDraft()}
+                disabled={!commitPreview.changed || mcpBusy}
+              >
+                {commitPreview.changed ? "正式提交" : "没有变化"}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </main>
   );
 }

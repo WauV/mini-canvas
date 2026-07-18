@@ -9,14 +9,18 @@
     "dev": "vinext dev",
     "build": "vinext build",
     "start": "vinext start",
-    "test": "npm run build && node --test tests/rendered-html.test.mjs && node --experimental-strip-types --test tests/document-repository.test.ts tests/document-statistics.test.ts tests/editor-actions.test.ts tests/obsidian-markdown.test.ts",
+    "test": "npm run build && node --test tests/rendered-html.test.mjs && node --experimental-strip-types --test tests/document-repository.test.ts tests/document-statistics.test.ts tests/editor-actions.test.ts tests/mcp-draft-client.test.ts tests/obsidian-markdown.test.ts",
     "benchmark": "node --experimental-strip-types scripts/benchmark-markdown.ts",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern .local",
     "db:generate": "drizzle-kit generate",
     "bridge:read": "node --experimental-strip-types livesync-bridge/src/cli.ts read",
     "bridge:write": "node --experimental-strip-types livesync-bridge/src/cli.ts write",
     "bridge:serve": "node --experimental-strip-types livesync-bridge/src/cli.ts serve",
-    "bridge:test": "node --experimental-strip-types livesync-bridge/tests/all.test.ts"
+    "bridge:test": "node --experimental-strip-types livesync-bridge/tests/all.test.ts",
+    "mcp:serve": "node --experimental-strip-types mcp-server/src/cli.ts serve",
+    "mcp:index": "node --experimental-strip-types mcp-server/src/cli.ts index",
+    "mcp:test": "node --experimental-strip-types mcp-server/tests/all.test.ts",
+    "mcp:typecheck": "tsc --noEmit -p mcp-server/tsconfig.json"
   },
   "dependencies": {
     "@codemirror/commands": "^6.10.4",
@@ -25,15 +29,19 @@
     "@codemirror/search": "^6.7.1",
     "@codemirror/state": "^6.7.1",
     "@codemirror/view": "^6.43.6",
+    "@modelcontextprotocol/ext-apps": "^1.7.4",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "drizzle-orm": "0.45.2",
     "katex": "^0.17.0",
     "next": "16.2.6",
     "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "react-dom": "19.2.6",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "1.37.1",
     "@tailwindcss/postcss": "4.2.1",
+    "@types/express": "^5.0.6",
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",

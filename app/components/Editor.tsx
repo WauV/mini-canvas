@@ -43,6 +43,7 @@ type EditorProps = {
   content: string;
   mode: EditorMode;
   onChange: (content: string) => void;
+  readOnly?: boolean;
 };
 
 type ToolbarItem = {
@@ -84,6 +85,9 @@ function minimalChange(
 ): { from: number; to: number; insert: string } | null {
   if (previousValue === nextValue) return null;
 
+  // This computes the smallest single contiguous replacement. Repeated text
+  // may allow several equally valid edits, but the resulting document and
+  // CodeMirror transaction remain deterministic.
   let prefix = 0;
   const shortestLength = Math.min(previousValue.length, nextValue.length);
   while (
@@ -195,13 +199,16 @@ export function Editor({
   content,
   mode,
   onChange,
+  readOnly = false,
 }: EditorProps) {
   const editorHostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
   const initialContentRef = useRef(content);
   const initialModeRef = useRef(mode);
+  const initialReadOnlyRef = useRef(readOnly);
   const modeCompartmentRef = useRef(new Compartment());
+  const readOnlyCompartmentRef = useRef(new Compartment());
 
   useEffect(() => {
     onChangeRef.current = onChange;
@@ -252,6 +259,10 @@ export function Editor({
         modeCompartmentRef.current.of(
           modeExtensions(initialModeRef.current),
         ),
+        readOnlyCompartmentRef.current.of([
+          EditorState.readOnly.of(initialReadOnlyRef.current),
+          EditorView.editable.of(!initialReadOnlyRef.current),
+        ]),
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
             onChangeRef.current(update.state.doc.toString());
@@ -294,13 +305,30 @@ export function Editor({
     });
   }, [mode]);
 
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: readOnlyCompartmentRef.current.reconfigure([
+        EditorState.readOnly.of(readOnly),
+        EditorView.editable.of(!readOnly),
+      ]),
+    });
+  }, [readOnly]);
+
   const runAction = useCallback((action: EditorAction) => {
     const view = viewRef.current;
     if (view) runEditorAction(view, action);
   }, []);
 
   return (
-    <article className={"workspace-panel editor-panel editor-mode-" + mode}>
+    <article
+      className={
+        "workspace-panel editor-panel editor-mode-" +
+        mode +
+        (readOnly ? " editor-read-only" : "")
+      }
+    >
       <div className="editor-toolbar" role="toolbar" aria-label="Markdown 格式">
         {TOOLBAR_GROUPS.map((group, groupIndex) => (
           <div className="toolbar-group" key={groupIndex}>
@@ -315,6 +343,7 @@ export function Editor({
                     : item.label
                 }
                 aria-label={item.label}
+                disabled={readOnly}
                 onMouseDown={(event) => event.preventDefault()}
                 onClick={() => runAction(item.action)}
               >

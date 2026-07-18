@@ -138,6 +138,17 @@ test("does not parse formatting inside fenced code blocks", () => {
   );
 });
 
+test("treats Wiki Link syntax inside inline code as literal text", () => {
+  const marker = String.fromCharCode(96);
+  const source = `${marker}[[not-a-link]]${marker}`;
+  const parsed = parseObsidianMarkdown(source);
+
+  assert.deepEqual(
+    parsed.tokens.map((token) => token.kind),
+    ["inline-code"],
+  );
+});
+
 test("keeps an unclosed fenced block protected through end of document", () => {
   const fence = String.fromCharCode(96).repeat(3);
   const parsed = parseObsidianMarkdown(
@@ -162,6 +173,19 @@ test("keeps escaped pipes inside a table cell", () => {
 
   assert.deepEqual(table?.data?.header, ["表达式", "含义"]);
   assert.deepEqual(table?.data?.rows, ["`a | b`\u001f或运算"]);
+});
+
+test("treats an even backslash run before a table pipe as a delimiter", () => {
+  const parsed = parseObsidianMarkdown(
+    [
+      "| 第一列 | 第二列 |",
+      "| --- | --- |",
+      String.raw`| \\| 分隔后的单元格 |`,
+    ].join("\n"),
+  );
+  const table = parsed.tokens.find((token) => token.kind === "table");
+
+  assert.deepEqual(table?.data?.rows, ["\\\u001f分隔后的单元格"]);
 });
 
 test("recognizes a same-line block formula", () => {
@@ -204,4 +228,75 @@ test("keeps a callout title outside the replaced marker prefix", () => {
     extensions: [obsidianLivePreview],
   });
   assert.equal(state.doc.toString(), source);
+});
+
+test("recognizes fenced SVG as a preview block without rewriting source", () => {
+  const fence = String.fromCharCode(96).repeat(3);
+  const svg = [
+    '<svg viewBox="0 0 120 40">',
+    '  <rect width="120" height="40" rx="8" fill="#d97757" />',
+    "</svg>",
+  ].join("\n");
+  const source = [fence + "svg", svg, fence].join("\n");
+  const parsed = parseObsidianMarkdown(source);
+  const token = parsed.tokens.find((item) => item.kind === "svg-block");
+
+  assert.equal(token?.data?.svg, svg);
+  assert.equal(token?.data?.svgFormat, "fence");
+  assert.deepEqual(parsed.tokens.map((item) => item.kind), ["svg-block"]);
+
+  const state = EditorState.create({
+    doc: source,
+    extensions: [obsidianLivePreview],
+  });
+  assert.equal(state.doc.toString(), source);
+});
+
+test("recognizes an inline SVG block and protects its text from Markdown parsing", () => {
+  const svg = [
+    '<svg viewBox="0 0 120 40">',
+    "  <text x=\"8\" y=\"25\">**不是粗体**</text>",
+    "</svg>",
+  ].join("\n");
+  const source = svg + "\n\n**外部粗体**";
+  const parsed = parseObsidianMarkdown(source);
+  const svgToken = parsed.tokens.find((item) => item.kind === "svg-block");
+  const strongTokens = parsed.tokens.filter((item) => item.kind === "strong");
+
+  assert.equal(svgToken?.data?.svg, svg);
+  assert.equal(svgToken?.data?.svgFormat, "inline");
+  assert.equal(strongTokens.length, 1);
+  assert.equal(
+    source.slice(strongTokens[0].contentFrom, strongTokens[0].contentTo),
+    "外部粗体",
+  );
+});
+
+test("keeps token offsets correct for CRLF input", () => {
+  const fence = String.fromCharCode(96).repeat(3);
+  const svg = '<svg viewBox="0 0 10 10"><circle r="4" /></svg>';
+  const source = [
+    fence + "svg",
+    svg,
+    fence,
+    "> [!note] CRLF 标题",
+    "> 正文",
+  ].join("\r\n");
+  const parsed = parseObsidianMarkdown(source);
+  const svgToken = parsed.tokens.find((item) => item.kind === "svg-block");
+  const callout = parsed.tokens.find((item) => item.kind === "callout");
+
+  assert.equal(
+    source.slice(svgToken?.contentFrom, svgToken?.contentTo),
+    svg,
+  );
+  assert.equal(svgToken?.data?.svg, svg);
+  assert.equal(callout?.data?.title, "CRLF 标题");
+  assert.equal(
+    source.slice(
+      callout?.markerRanges?.[0]?.from,
+      callout?.markerRanges?.[0]?.to,
+    ),
+    "> [!note] ",
+  );
 });

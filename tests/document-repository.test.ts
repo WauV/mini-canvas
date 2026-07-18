@@ -11,6 +11,7 @@ import {
   DEFAULT_DOCUMENT_ID,
   DocumentConflictError,
 } from "../app/lib/documents/types.ts";
+import { DocumentSaveQueue } from "../app/lib/documents/save-queue.ts";
 
 class MemoryStorage {
   readonly values = new Map<string, string>();
@@ -92,4 +93,39 @@ test("keeps a recovery snapshot outside the primary document slot", async () => 
 
   await repository.clearRecovery();
   assert.equal(await repository.loadRecovery(), null);
+});
+
+test("serializes document saves instead of running them concurrently", async () => {
+  const queue = new DocumentSaveQueue();
+  const events: string[] = [];
+  let releaseFirst: (() => void) | undefined;
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+
+  const first = queue.run(async () => {
+    events.push("first:start");
+    await firstGate;
+    events.push("first:end");
+  });
+  const second = queue.run(async () => {
+    events.push("second:start");
+  });
+
+  await Promise.resolve();
+  assert.deepEqual(events, ["first:start"]);
+  releaseFirst?.();
+  await Promise.all([first, second]);
+  assert.deepEqual(events, ["first:start", "first:end", "second:start"]);
+});
+
+test("continues the save queue after a failed operation", async () => {
+  const queue = new DocumentSaveQueue();
+  const failed = queue.run(async () => {
+    throw new Error("save failed");
+  });
+  const recovered = queue.run(async () => "saved");
+
+  await assert.rejects(failed, /save failed/u);
+  assert.equal(await recovered, "saved");
 });

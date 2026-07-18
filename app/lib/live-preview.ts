@@ -13,6 +13,7 @@ import {
   parseObsidianMarkdown,
   type TextRange,
 } from "./obsidian-markdown.ts";
+import { sanitizeSvgMarkup } from "./svg-preview.ts";
 
 function focusSource(
   view: EditorView,
@@ -73,6 +74,69 @@ class MathWidget extends WidgetType {
       focusSource(view, this.from, this.to, this.displayMode ? 3 : 1);
     });
     return element;
+  }
+
+  ignoreEvent(): boolean {
+    return false;
+  }
+}
+
+class SvgWidget extends WidgetType {
+  readonly source: string;
+  readonly from: number;
+  readonly to: number;
+
+  constructor(source: string, from: number, to: number) {
+    super();
+    this.source = source;
+    this.from = from;
+    this.to = to;
+  }
+
+  eq(other: SvgWidget): boolean {
+    return (
+      this.source === other.source &&
+      this.from === other.from &&
+      this.to === other.to
+    );
+  }
+
+  toDOM(view: EditorView): HTMLElement {
+    const wrapper = document.createElement("div");
+    wrapper.className = "cm-svg-widget";
+    wrapper.title = "点击编辑 SVG 源码";
+
+    const sanitized = sanitizeSvgMarkup(this.source);
+    if (sanitized.markup) {
+      const image = document.createElement("img");
+      const objectUrl = URL.createObjectURL(
+        new Blob([sanitized.markup], { type: "image/svg+xml" }),
+      );
+      wrapper.dataset.svgObjectUrl = objectUrl;
+      image.className = "cm-svg-image";
+      image.src = objectUrl;
+      image.alt = "SVG 图形预览";
+      image.draggable = false;
+      wrapper.appendChild(image);
+    } else {
+      wrapper.classList.add("cm-svg-widget-error");
+      const label = document.createElement("strong");
+      label.textContent = "SVG 无法预览";
+      const detail = document.createElement("span");
+      detail.textContent = sanitized.error ?? "请检查 SVG 源码";
+      wrapper.append(label, detail);
+    }
+
+    wrapper.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      focusSource(view, this.from, this.to);
+    });
+    return wrapper;
+  }
+
+  destroy(dom: HTMLElement): void {
+    const objectUrl = dom.dataset.svgObjectUrl;
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
   }
 
   ignoreEvent(): boolean {
@@ -542,6 +606,26 @@ function buildDecorations(
           );
         }
         if (!active) addMarkerReplacements(ranges, token.markerRanges);
+        break;
+      }
+
+      case "svg-block": {
+        if (active) {
+          for (const line of linesInside(parsed.lines, token)) {
+            addLineDecoration(ranges, line, "cm-svg-source-line");
+          }
+        } else {
+          ranges.push(
+            Decoration.replace({
+              widget: new SvgWidget(
+                tokenTextData(token, "svg"),
+                token.from,
+                token.to,
+              ),
+              block: true,
+            }).range(token.from, token.to),
+          );
+        }
         break;
       }
 

@@ -2,9 +2,9 @@
 
 一个面向 ChatGPT Canvas / MCP Apps 场景的轻量写作实验项目。
 
-当前已经完成前端编辑器 MVP，以及隔离测试环境中的 LiveSync V2 Bridge 读写闭环。下一阶段接入 Python MCP 草稿、授权与搜索层，再逐步包装为 ChatGPT Widget。
+当前已经完成前端编辑器 MVP、隔离测试环境中的 LiveSync V2 Bridge、Node.js / TypeScript MCP 草稿、授权、搜索和附件读取层，以及编辑器到 MCP 加密草稿的完整本地接入。下一阶段使用 MCP Inspector 做协议验收，再把同一编辑器核心注册为 ChatGPT Widget。
 
-> 当前状态：前端仍使用浏览器 Local Storage；Node Bridge 已能在隔离测试 CouchDB 中加密读写并与 Obsidian 双向同步。正式 Vault 从未接入测试链路。
+> 当前状态：新建文档和示例仍使用浏览器 Local Storage；点击“打开笔记”后，编辑器会切换到 MCP Draft Repository，自动保存加密草稿，并在用户确认预览后通过 Bridge 安全提交。所有联调只使用隔离 CouchDB 与测试 Vault，正式 Vault 从未接入测试链路。
 
 ## 已实现功能
 
@@ -15,9 +15,12 @@
 - Obsidian Wiki Link、Embed、引用、脚注、Callout、高亮、标签、注释、Block ID 与 Frontmatter
 - 可交互任务列表和 Markdown 表格
 - 行内与块级 LaTeX 公式；点击公式可返回源码编辑
+- 内联 `<svg>...</svg>` 与 `svg` 代码围栏的安全图形预览
 - 可切换的 Markdown 快捷工具栏：已有格式再次点击即可取消或替换
 - 文档标题编辑，以及适合中英文混排的行数、字词、字符统计
-- 通过 `DocumentRepository` 自动保存到浏览器本地，并支持版本检查、幂等键和旧数据迁移
+- 通过统一 `DocumentRepository` 自动保存浏览器本地文档或 MCP 加密草稿
+- 从隔离 Vault 列出并打开 Markdown 笔记，提供草稿版本、提交预览和正式提交
+- 草稿乐观锁、串行保存队列、revision 冲突提示和幂等写回
 - 新建或加载示例前保留恢复版本，避免误操作直接覆盖草稿
 - 文档变化时才重新解析 Markdown；仅移动光标或改变选区时复用解析结果
 - 桌面端与移动端响应式布局
@@ -42,6 +45,8 @@ npm run dev
 启动后访问：
 
 <http://localhost:3000>
+
+只运行 `npm run dev` 时可以使用本地文档和完整编辑器。要打开隔离 Vault 中的笔记，还需要先启动测试 CouchDB、Bridge 和 MCP Server，具体顺序见后文“本地 LiveSync 测试环境”和“TypeScript MCP Server”。
 
 ## 使用示例
 
@@ -82,6 +87,32 @@ $$
 $$
 ```
 
+### SVG
+
+可以直接保留 Obsidian / Markdown 中的内联 SVG：
+
+```markdown
+<svg viewBox="0 0 240 80" role="img" aria-label="示意图">
+  <rect width="240" height="80" rx="16" fill="#f4e2d6" />
+  <text x="120" y="48" text-anchor="middle" fill="#75422f">
+    Mini Canvas
+  </text>
+</svg>
+```
+
+也可以使用更适合编辑长图形源码的 `svg` 代码围栏：
+
+````markdown
+```svg
+<svg viewBox="0 0 120 40">
+  <circle cx="20" cy="20" r="14" fill="#d97757" />
+  <path d="M44 20 H108" stroke="#75422f" stroke-width="4" />
+</svg>
+```
+````
+
+Live Preview 会把 SVG 作为隔离的图片资源显示，不会用 `innerHTML` 直接执行源码。脚本、事件属性、`foreignObject`、动画元素和外部资源引用会被移除；点击预览可以回到原始 SVG 编辑。TikZ 暂不支持。
+
 ## 快捷键
 
 | 快捷键 | 功能 |
@@ -111,8 +142,9 @@ Live Preview 只为原始文本添加视觉装饰，不会先转换成富文本�
 - `^block-id`
 - YAML Frontmatter
 - 行内和块级 LaTeX
+- 内联 SVG 与 `svg` 代码围栏
 
-当前还没有连接 Vault，因此 Wiki Link 暂时只负责显示，Embed 暂时显示为附件占位卡片，不能读取真实笔记或附件。不认识的语法保持源码显示，不会被删除或改写。
+当前网页已经可以通过 MCP Repository 打开和保存笔记，但 Wiki Link 暂时只负责显示，Embed 仍显示为附件占位卡片。后端已经具备附件读取接口，`![[示意图.svg]]` 的就地加载与渲染还没有接入编辑器；当前页面可用的是笔记内直接保存的 SVG 源码。不认识的语法保持源码显示，不会被删除或改写。
 
 这里的解析器是面向编辑体验的渐进式实现，不是完整的 CommonMark / GFM 合规解析器。当前已经处理转义表格分隔符、未闭合代码围栏和同行块级公式等常见边界，但复杂嵌套、任意反引号长度、深层列表与引用等情况仍需要继续补齐。原始 Markdown 始终留在 CodeMirror 文档中，因此未识别语法不会因预览而丢失。
 
@@ -126,11 +158,18 @@ mini-canvas/
 │   ├── lib/
 │   │   ├── documents/
 │   │   │   ├── local-storage-repository.ts
+│   │   │   ├── mcp-draft-repository.ts
+│   │   │   ├── save-queue.ts
 │   │   │   └── types.ts
+│   │   ├── mcp/
+│   │   │   ├── mini-canvas-client.ts
+│   │   │   └── tool-client.ts
 │   │   ├── document-statistics.ts
 │   │   ├── editor-actions.ts
 │   │   ├── live-preview.ts
-│   │   └── obsidian-markdown.ts
+│   │   ├── obsidian-markdown.ts
+│   │   └── svg-preview.ts
+│   ├── api/mcp-tools/route.ts
 │   ├── globals.css
 │   ├── layout.tsx
 │   ├── MiniCanvas.tsx
@@ -139,10 +178,18 @@ mini-canvas/
 │   ├── document-repository.test.ts
 │   ├── document-statistics.test.ts
 │   ├── editor-actions.test.ts
+│   ├── mcp-draft-client.test.ts
 │   ├── obsidian-markdown.test.ts
 │   └── rendered-html.test.mjs
+├── livesync-bridge/
+│   ├── src/
+│   └── tests/
+├── mcp-server/
+│   ├── src/
+│   └── tests/
 ├── scripts/
 │   ├── benchmark-markdown.ts
+│   ├── setup-mcp-env.ps1
 │   ├── setup-test-couchdb.ps1
 │   ├── stop-test-couchdb.ps1
 │   └── verify-test-environment.ps1
@@ -163,18 +210,22 @@ mini-canvas/
 | `npm run benchmark` | 对 5 千至 10 万字符文档执行解析与编辑压力测试 |
 | `npm run bridge:test` | 测试 LiveSync V2 加密和 xxHash64 兼容逻辑 |
 | `npm run bridge:serve` | 启动只监听本机的 Node LiveSync Bridge API |
+| `npm run mcp:test` | 测试授权、加密草稿、搜索索引和 MCP 工具契约 |
+| `npm run mcp:typecheck` | 单独检查 MCP Server TypeScript 类型 |
+| `npm run mcp:index -- --rebuild` | 从隔离 Vault 重建加密搜索索引 |
+| `npm run mcp:serve` | 启动只监听本机的 Streamable HTTP MCP Server |
 
 ## 数据保存说明
 
-当前网页编辑器的标题和正文仍由 `LocalStorageDocumentRepository` 保存在浏览器的 Local Storage 中：
+编辑器现在有两种明确的数据模式：
 
-- 数据只存在于当前浏览器和当前设备
-- 网页前端暂时不会直接同步到 Obsidian 或 CouchDB
-- 清理浏览器站点数据可能导致草稿丢失
-- 当前版本不适合存放唯一副本或重要敏感内容
-- “新建”和“示例”会先把当前内容写入独立恢复槽；顶部出现“恢复”后可以交换回上一版本
+- **本地文档**：新建文档和示例由 `LocalStorageDocumentRepository` 保存在当前浏览器；清理站点数据会删除这部分内容。
+- **Obsidian 笔记**：点击“打开笔记”后，由 `McpDraftDocumentRepository` 创建并加载服务端加密草稿；后续输入经过 320 ms 节流和串行保存队列写入 SQLite 密文草稿。
+- MCP 草稿不会直接覆盖 Obsidian。用户需要先生成提交预览，再点击“正式提交”；提交成功后当前草稿进入只读状态，点击“继续编辑”会从最新 revision 创建新草稿。
+- 若 Obsidian 在草稿期间发生修改，提交会明确报告 revision 冲突，草稿继续保留，不会静默覆盖新内容。
+- “新建”“示例”“恢复”和切换笔记仍会使用浏览器恢复槽保护当前版本。恢复槽是本机临时保护，不应当作唯一备份。
 
-编辑器组件只依赖统一的 `DocumentRepository` 契约，不直接了解 Local Storage、CouchDB 或 LiveSync。后续会新增 `McpDocumentRepository`，把浏览器本地保存降级为临时保护，而由 MCP 草稿服务和 CouchDB 作为最终数据来源。保存契约已经包含 `expectedVersion` 与 `idempotencyKey`，未来接远端时可以明确报告冲突而不是静默覆盖。
+编辑器组件只依赖统一的 `DocumentRepository` 契约，不直接了解 CouchDB、LiveSync 密钥或数据块格式。本地开发页通过同源的 `/api/mcp-tools` 服务端代理调用 MCP，Bearer Token 只存在于本机服务端运行环境，不会返回浏览器或写入生产前端包；嵌入 ChatGPT 后则由同一个前端客户端改用 MCP Apps Bridge 的 `tools/call`。
 
 ## 本地 LiveSync 测试环境
 
@@ -238,7 +289,7 @@ npm run bridge:write -- "MiniCanvas Bridge Roundtrip.md" `
 - `expectedRevision`：只允许覆盖调用方实际读过的版本；过期时明确返回冲突。
 - `idempotencyKey`：相同提交重试时不会重复生成一次业务写入；同一个键不能复用于不同内容。
 
-启动供后续 Python MCP Server 调用的 Note-level API：
+启动供后续 TypeScript MCP Server 调用的 Note-level API：
 
 ```powershell
 npm run bridge:serve
@@ -251,6 +302,9 @@ npm run bridge:serve
 | `GET /health` | 本机健康检查 | 无 |
 | `POST /v1/notes/read` | 按 Vault 相对路径读取并解密笔记 | Bearer Token |
 | `POST /v1/notes/commit` | 按 revision 与幂等键加密提交 | Bearer Token |
+| `POST /v1/entries/list` | 分页列出笔记与附件元数据 | Bearer Token |
+| `POST /v1/changes/poll` | 使用 opaque sequence 长轮询文件级变更 | Bearer Token |
+| `POST /v1/attachments/read` | 解密并返回原始附件字节 | Bearer Token |
 
 安全边界：服务地址被代码固定为 `127.0.0.1`，不向局域网暴露；业务接口要求 Bearer Token，也不开放浏览器 CORS。CouchDB 凭据和 LiveSync 口令只保存在已被 Git 忽略的 `.local/` 中，不进入前端包。所有 CouchDB JSON 都按严格 UTF-8 解码，正文写回后还会用元数据中的 UTF-8 字节数再次校验。
 
@@ -265,6 +319,57 @@ npm run bridge:serve
 - 本机 HTTP API 验证为：健康检查 `200`、无认证读取 `401`、带认证读取 `200; charset=utf-8`。
 
 这些结果只证明当前隔离配置的读写兼容性。正式 Vault 在完成备份、权限和恢复演练前仍不应接入。
+
+## TypeScript MCP Server
+
+MCP Server 位于 `mcp-server/`，只连接本机 Bridge，不保存 CouchDB 账号或 LiveSync 口令。它使用 Streamable HTTP，默认监听 `http://127.0.0.1:3220/mcp`。
+
+首次配置：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-mcp-env.ps1
+```
+
+脚本会在 `.local/mcp-server.env` 生成独立的 32-byte 主密钥和 Bearer Token，并读取已有的本地 Bridge Token。生成值不会写入 README、前端包或 Git。
+
+连接编辑器时，分别在三个终端中按顺序启动 Bridge、MCP Server 和开发页：
+
+```powershell
+npm run bridge:serve
+npm run mcp:serve
+npm run dev
+```
+
+随后访问 `http://localhost:3000`，点击“打开笔记”。本地开发页使用同源服务端代理，因此浏览器不会收到 MCP Bearer Token。打开笔记后，顶部状态会区分“已保存到加密草稿”和“已提交到 Obsidian”；正式写回必须经过“预览提交 → 正式提交”两步。
+
+首次启动会自动建立搜索索引；也可以显式重建：
+
+```powershell
+npm run mcp:index -- --rebuild
+```
+
+已经注册的工具：
+
+- `list_entries`、`read_attachment`
+- `search`、`fetch`
+- `create_draft`、`get_draft`、`update_draft`
+- `preview_commit`、`commit_draft`
+- `refresh_search_index`
+
+权限由 Bearer Token 映射为 `userId`、`scopes` 和 `allowedPaths`。路径授权在服务端执行，不信任 Widget 或客户端传来的身份提示。草稿正文、基线正文和路径使用 AES-256-GCM 加密；搜索词元使用 HMAC，搜索文档的路径与标题也加密，SQLite 不保存笔记正文。
+
+附件策略：PNG、JPEG、WebP 和 GIF 可以作为 MCP image content 返回；SVG 和受支持的 UTF-8 文本作为文本返回；ZIP、DOCX、PDF 等其他二进制只返回元数据，不会把 Base64 内容塞进模型上下文。
+
+2026-07-18 在隔离数据库中验证：
+
+- 完整列表分 4 页得到 60 篇 Markdown 和 91 个附件。
+- SVG 正确恢复为 UTF-8 源码，ZIP/DOCX 按每个 LiveSync chunk 独立 Base64 解码并恢复原始文件头。
+- 60 篇笔记全量索引成功，中英文搜索与 `fetch` 正常。
+- MCP 无认证请求返回 `401`，10 个工具均带影响 annotations。
+- 草稿经过创建、版本更新、提交预览和幂等提交，从 revision 3 写到 revision 4。
+- 后台 `_changes` 监听自动捕获提交，并把新增标记增量加入搜索索引。
+- 编辑器同源代理完成真实链路验收：列出隔离 Vault、创建草稿 v1、自动保存到 v2、生成变化预览，并把 `MiniCanvas Bridge Roundtrip.md` 安全提交到 revision 5。
+- 并发验收中，另一个草稿先提交到 revision 6 后，基于 revision 5 的提交收到 `revision_conflict`；新内容未被覆盖，冲突草稿仍保持 `active` 且正文完整。
 
 ## 性能基线
 
@@ -287,11 +392,11 @@ ChatGPT / MCP Apps Widget
 OpenAI Secure MCP Tunnel
             │
             ▼
-Python MCP Server
+Node.js / TypeScript MCP Server
 认证 · 授权 · 草稿 · 预览 · 提交 · 搜索
             │
             ▼
-Node.js LiveSync Bridge
+TypeScript LiveSync Bridge（Node.js）
 加解密 · revision · chunk · 冲突 · 幂等写入
             │
             ▼
@@ -304,18 +409,20 @@ Obsidian Self-hosted LiveSync
 计划中的职责边界：
 
 - **前端 / Widget**：编辑、预览和发起工具调用，不直接访问 CouchDB
-- **Python MCP Server**：用户鉴权、路径权限、草稿状态机、提交确认和搜索协调
-- **Node.js LiveSync Bridge**：处理 LiveSync 数据格式、加解密、附件、逻辑版本和冲突
+- **TypeScript MCP Server（Node.js）**：用户鉴权、路径权限、草稿状态机、提交确认、搜索协调，以及注册 MCP 工具和 Widget 资源
+- **TypeScript LiveSync Bridge（Node.js）**：处理 LiveSync 数据格式、加解密、附件、逻辑版本和冲突
 - **CouchDB**：作为同步数据的事实来源
 - **SQLite**：仅保存草稿状态和可重建的搜索索引
 
 每次正式写入都应携带预期版本和幂等键；发现冲突时明确返回，不静默覆盖。
 
+这里不再为 MCP 层单独引入 Python。前端、MCP Server 与 LiveSync Bridge 统一使用 TypeScript，可以直接共享 `DocumentSnapshot`、工具输入输出、权限规则、错误类型和校验模型，也只需要维护一套 Node.js 构建、测试与部署环境。MCP Server 与 LiveSync Bridge 仍保持为两个独立模块：前者负责面向 ChatGPT 的业务与权限边界，后者只负责 LiveSync 兼容和密文仓库读写，避免把 CouchDB 凭据暴露给 Widget。
+
 ## 本地页面与 ChatGPT Widget
 
-当前通过 `http://localhost:3000` 打开的页面是一个**独立开发预览页**。它占据整个 Chrome 页面是正常现象，作用是先在本地开发和验证编辑、预览、LaTeX 与保存逻辑；它还不是最终嵌入 ChatGPT 的界面。
+当前通过 `http://localhost:3000` 打开的页面是一个**独立开发预览页**。它占据整个 Chrome 页面是正常现象，作用是先在本地开发和验证编辑、预览、LaTeX 与 MCP 草稿逻辑；它还不是最终嵌入 ChatGPT 的界面。
 
-最终会把编辑器核心包装成 ChatGPT Apps SDK Widget，并复用同一套编辑与预览能力：
+编辑器的数据调用已经抽象为统一 Tool Client：独立开发页使用本机同源代理，嵌入页面会使用 MCP Apps Bridge 的 `ui/initialize` 和 `tools/call`。接下来会把编辑器核心注册为 ChatGPT Apps SDK Widget，并复用同一套编辑、预览和草稿能力：
 
 ```text
 编辑器核心
@@ -355,9 +462,9 @@ await window.openai?.requestDisplayMode({
 接入时需要完成：
 
 1. 将当前 React 编辑器打包为可嵌入的 Widget 资源。
-2. 在 Python MCP Server 中注册 Widget 资源和相关工具。
+2. 在 TypeScript MCP Server 中注册 Widget 资源和相关工具。
 3. 让打开笔记等工具返回 Widget 所需的结构化数据。
-4. Widget 通过 MCP Apps Bridge 调用保存草稿、预览提交和正式提交工具。
+4. 把已经实现的 MCP Apps Bridge Tool Client 接到正式 Widget 资源上下文中。
 5. 保留本地预览页作为开发入口，不在 Widget 内重复实现 ChatGPT 对话栏。
 
 相关官方文档：
@@ -381,8 +488,10 @@ await window.openai?.requestDisplayMode({
 - [x] 实现 Node.js LiveSync Bridge 的读取、加密写回和本机 Note-level API
 - [x] 验证 Obsidian 与 Bridge 双向同步且中文不乱码
 - [x] 补齐 revision 冲突检测和幂等提交
-- [ ] 增加变更监听、附件读取和更完整的列表接口
-- [ ] 接入 Python 草稿、授权与搜索层
+- [x] 增加变更监听、附件读取和更完整的列表接口
+- [x] 实现 Node.js / TypeScript MCP 草稿、授权与搜索层
+- [x] 将编辑器接入 MCP 加密草稿、提交预览和安全写回
+- [x] 增加本地同源 MCP 代理与 MCP Apps Bridge Tool Client
 - [ ] 使用 MCP Inspector 验证工具接口
 - [ ] 接入 Secure MCP Tunnel
 - [ ] 将编辑器核心打包为 ChatGPT Apps SDK Widget
@@ -392,6 +501,7 @@ await window.openai?.requestDisplayMode({
 
 - React 19
 - TypeScript
+- Node.js 22
 - Next.js / Vinext
 - CodeMirror 6
 - KaTeX

@@ -3,6 +3,35 @@ type CouchDbErrorBody = {
   reason?: string;
 };
 
+export type CouchDatabaseInfo = {
+  update_seq: string | number;
+};
+
+export type CouchAllDocsRow<T> = {
+  id: string;
+  key: string;
+  value: { rev: string; deleted?: boolean };
+  doc?: T;
+};
+
+export type CouchAllDocsResult<T> = {
+  rows: CouchAllDocsRow<T>[];
+};
+
+export type CouchChange<T> = {
+  seq: string | number;
+  id: string;
+  changes: Array<{ rev: string }>;
+  deleted?: boolean;
+  doc?: T;
+};
+
+export type CouchChangesResult<T> = {
+  results: CouchChange<T>[];
+  last_seq: string | number;
+  pending?: number;
+};
+
 export class CouchDbHttpError extends Error {
   readonly status: number;
   readonly errorCode?: string;
@@ -117,5 +146,39 @@ export class CouchDbClient {
       method: "PUT",
       body: JSON.stringify(document),
     });
+  }
+
+  async getDatabaseInfo(): Promise<CouchDatabaseInfo> {
+    return this.request<CouchDatabaseInfo>("");
+  }
+
+  async listDocumentsPage<T>(
+    afterId: string | undefined,
+    limit: number,
+  ): Promise<CouchAllDocsResult<T>> {
+    const params = new URLSearchParams({
+      include_docs: "true",
+      limit: String(limit),
+    });
+    if (afterId !== undefined) {
+      params.set("startkey", JSON.stringify(afterId));
+      params.set("skip", "1");
+    }
+    return this.request<CouchAllDocsResult<T>>(`_all_docs?${params.toString()}`);
+  }
+
+  async pollChanges<T>(options: {
+    since: string;
+    limit: number;
+    timeoutMs: number;
+  }): Promise<CouchChangesResult<T>> {
+    const params = new URLSearchParams({
+      feed: "longpoll",
+      include_docs: "true",
+      since: options.since,
+      limit: String(options.limit),
+      timeout: String(options.timeoutMs),
+    });
+    return this.request<CouchChangesResult<T>>(`_changes?${params.toString()}`);
   }
 }
