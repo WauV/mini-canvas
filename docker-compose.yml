@@ -1,0 +1,151 @@
+name: mini-canvas-test
+
+services:
+  couchdb-test:
+    image: couchdb:3
+    container_name: mini-canvas-couchdb-test
+    restart: unless-stopped
+    env_file:
+      - ./.local/couchdb.env
+    ports:
+      - "127.0.0.1:${COUCHDB_PORT:-5984}:5984"
+    volumes:
+      - couchdb-test-data:/opt/couchdb/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl --fail --silent --show-error
+          --user "$${COUCHDB_USER}:$${COUCHDB_PASSWORD}"
+          http://127.0.0.1:5984/_up > /dev/null
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - mini-canvas-backend
+
+  couchdb-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: livesync-bridge
+    image: mini-canvas-livesync-bridge:local
+    restart: "no"
+    command:
+      - node
+      - --experimental-strip-types
+      - scripts/init-couchdb-container.ts
+    env_file:
+      - ./.local/couchdb.env
+    environment:
+      COUCHDB_URL: http://couchdb-test:5984
+    depends_on:
+      couchdb-test:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - mini-canvas-backend
+
+  livesync-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: livesync-bridge
+    image: mini-canvas-livesync-bridge:local
+    restart: unless-stopped
+    env_file:
+      - ./.local/couchdb.env
+      - ./.local/livesync-bridge.env
+    environment:
+      COUCHDB_URL: http://couchdb-test:5984
+      LIVESYNC_BRIDGE_HOST: 0.0.0.0
+      LIVESYNC_BRIDGE_PORT: 3210
+    expose:
+      - "3210"
+    depends_on:
+      couchdb-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:3210/health').then(response =>
+          process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - mini-canvas-backend
+
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: mcp-server
+    image: mini-canvas-mcp-server:local
+    restart: unless-stopped
+    env_file:
+      - ./.local/mcp-server.env
+    environment:
+      MINI_CANVAS_MCP_HOST: 0.0.0.0
+      MINI_CANVAS_MCP_ALLOWED_HOSTS: 127.0.0.1,localhost,mcp-server
+      MINI_CANVAS_MCP_PORT: 3220
+      MINI_CANVAS_MCP_DB: /data/mcp-server.sqlite
+      MINI_CANVAS_BRIDGE_URL: http://livesync-bridge:3210
+    ports:
+      - "127.0.0.1:3220:3220"
+    volumes:
+      - mcp-server-data:/data
+    depends_on:
+      livesync-bridge:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:3220/health').then(response =>
+          process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - mini-canvas-backend
+
+networks:
+  mini-canvas-backend:
+    name: mini-canvas-test-backend
+
+volumes:
+  couchdb-test-data:
+    name: mini-canvas-couchdb-test-data
+  mcp-server-data:
+    name: mini-canvas-mcp-server-data

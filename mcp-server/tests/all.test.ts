@@ -1,3 +1,5 @@
+import "./config.test.ts";
+
 import assert from "node:assert/strict";
 import { readFileSync, rmSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
@@ -31,6 +33,7 @@ import { createMiniCanvasMcpServer } from "../src/mcp.ts";
 import { SearchCoordinator, SearchIndex, tokenizeSearchText } from "../src/search.ts";
 import { MiniCanvasService } from "../src/service.ts";
 import type { Principal } from "../src/types.ts";
+import { MINI_CANVAS_WIDGET_URI } from "../src/widget.ts";
 
 const masterKey = Buffer.alloc(32, 7);
 
@@ -171,6 +174,31 @@ test("drafts are encrypted at rest and use optimistic versions", async () => {
   }
 });
 
+test("expiring a draft returns the same updated timestamp written to SQLite", () => {
+  const database = new McpDatabase(":memory:");
+  const repository = new DraftRepository(database, new AtRestCrypto(masterKey));
+  const draft = repository.create({
+    userId: "tester",
+    path: "Notes/Expired.md",
+    content: "# Expired",
+    baseRevision: "1-expired",
+  });
+  database.connection
+    .prepare("UPDATE drafts SET expires_at = 0, updated_at = 1 WHERE id = ?")
+    .run(draft.id);
+
+  const before = Date.now();
+  const expired = repository.get(draft.id, "tester");
+  const persisted = database.connection
+    .prepare("SELECT updated_at FROM drafts WHERE id = ?")
+    .get(draft.id) as { updated_at: number };
+
+  assert.equal(expired.status, "expired");
+  assert.ok(expired.updatedAt >= before);
+  assert.equal(expired.updatedAt, persisted.updated_at);
+  database.close();
+});
+
 test("search index supports English and CJK without storing note plaintext", () => {
   const database = new McpDatabase(":memory:");
   const crypto = new AtRestCrypto(masterKey);
@@ -233,7 +261,7 @@ test("service completes draft preview and commit through the gateway", async () 
   database.close();
 });
 
-test("MCP exposes annotated tools and can create a draft", async () => {
+test("MCP exposes the Widget resource, annotated tools and encrypted draft launch", async () => {
   const database = new McpDatabase(":memory:");
   const crypto = new AtRestCrypto(masterKey);
   const gateway = new FakeGateway();
@@ -250,8 +278,63 @@ test("MCP exposes annotated tools and can create a draft", async () => {
   await server.connect(serverTransport);
   await client.connect(clientTransport);
   const tools = await client.listTools();
-  assert.equal(tools.tools.length, 10);
+  assert.equal(tools.tools.length, 11);
   assert.equal(tools.tools.every((tool) => tool.annotations?.readOnlyHint !== undefined), true);
+  assert.equal(
+    tools.tools.every((tool) =>
+      (tool._meta?.securitySchemes as Array<{ type: string }> | undefined)?.some(
+        (scheme) => scheme.type === "noauth",
+      ),
+    ),
+    true,
+  );
+  const openTool = tools.tools.find((tool) => tool.name === "open_mini_canvas");
+  assert.equal(
+    (openTool?._meta?.ui as { resourceUri?: string } | undefined)?.resourceUri,
+    MINI_CANVAS_WIDGET_URI,
+  );
+  assert.equal(openTool?._meta?.["ui/resourceUri"], MINI_CANVAS_WIDGET_URI);
+
+  const resources = await client.listResources();
+  assert.equal(resources.resources.length, 1);
+  assert.equal(resources.resources[0]?.uri, MINI_CANVAS_WIDGET_URI);
+  assert.equal(resources.resources[0]?.mimeType, "text/html;profile=mcp-app");
+  const widget = await client.readResource({ uri: MINI_CANVAS_WIDGET_URI });
+  const widgetContent = widget.contents[0];
+  assert.equal(widgetContent && "text" in widgetContent, true);
+  if (!widgetContent || !("text" in widgetContent)) {
+    throw new Error("Widget resource did not return HTML text");
+  }
+  assert.equal(widgetContent.mimeType, "text/html;profile=mcp-app");
+  assert.match(widgetContent.text, /id="mini-canvas-root"/u);
+  assert.match(widgetContent.text, /<script type="module">/u);
+  assert.doesNotMatch(widgetContent.text, /MINI_CANVAS_MCP_AUTH_JSON/u);
+
+  const pickerResult = await client.callTool({
+    name: "open_mini_canvas",
+    arguments: {},
+  });
+  assert.deepEqual(pickerResult.structuredContent, { mode: "picker" });
+  const launchResult = await client.callTool({
+    name: "open_mini_canvas",
+    arguments: { path: "Notes/Test.md" },
+  });
+  assert.equal(
+    (launchResult.structuredContent as { path: string }).path,
+    "Notes/Test.md",
+  );
+  const launchedDraftId = (launchResult.structuredContent as { draftId?: string })
+    .draftId;
+  assert.equal(typeof launchedDraftId, "string");
+  const launchedDraft = await client.callTool({
+    name: "get_draft",
+    arguments: { draftId: launchedDraftId },
+  });
+  assert.equal(
+    (launchedDraft.structuredContent as { content: string }).content,
+    "# MCP",
+  );
+
   const result = await client.callTool({
     name: "create_draft",
     arguments: { path: "Notes/Test.md" },

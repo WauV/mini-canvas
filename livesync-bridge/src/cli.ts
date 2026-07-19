@@ -21,7 +21,7 @@ async function main(): Promise<void> {
     const config = loadBridgeServerConfig();
     const server = await startBridgeHttpServer(config);
     process.stdout.write(
-      `LiveSync Bridge 正在 ${config.host}:${config.port} 监听（仅本机）\n`,
+      `LiveSync Bridge 正在 ${config.host}:${config.port} 监听\n`,
     );
     await new Promise<void>((resolve) => {
       const close = (): void => {

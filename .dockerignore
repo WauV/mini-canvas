@@ -1,0 +1,29 @@
+.git
+.github
+.claude
+.local
+.next
+.vinext
+.wrangler
+coverage
+dist
+node_modules
+outputs
+work
+*.log
+*.tsbuildinfo
+
+# Generated locally and rebuilt inside the image.
+mcp-server/widget-dist
+
+# Development-only material is not part of either runtime image.
+tests
+examples
+infra
+db
+drizzle
+public
+worker
+build
+docker-compose*.yml
+README.md

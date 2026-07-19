@@ -14,7 +14,10 @@ export async function startMcpHttpServer(
   config: McpConfig,
   runtime: McpRuntime,
 ): Promise<Server> {
-  const app = createMcpExpressApp({ host: config.host });
+  const app = createMcpExpressApp({
+    host: config.host,
+    allowedHosts: config.allowedHosts,
+  });
 
   app.get("/health", async (_request: Request, response: Response) => {
     const bridge = await runtime.gateway.health();
@@ -28,6 +31,21 @@ export async function startMcpHttpServer(
       lastEventAt: search.lastEventAt,
     });
   });
+
+  // This deployment intentionally exposes no OAuth challenge to ChatGPT. The
+  // Tunnel injects the private Bearer token only on the local MCP hop. Return a
+  // clean 404 so discovery clients do not try to parse Express' HTML fallback.
+  const oauthMetadataNotAvailable = (_request: Request, response: Response) => {
+    response.status(404).end();
+  };
+  app.get(
+    "/.well-known/oauth-protected-resource/mcp",
+    oauthMetadataNotAvailable,
+  );
+  app.get(
+    "/.well-known/oauth-protected-resource",
+    oauthMetadataNotAvailable,
+  );
 
   app.use(
     "/mcp",

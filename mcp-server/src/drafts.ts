@@ -94,10 +94,12 @@ export class DraftRepository {
       .get(id, userId) as DraftRow | undefined;
     if (!row) throw new DraftNotFoundError();
     if (row.status === "active" && row.expires_at <= Date.now()) {
+      const expiredAt = Date.now();
       this.db.connection
         .prepare("UPDATE drafts SET status = 'expired', updated_at = ? WHERE id = ?")
-        .run(Date.now(), id);
+        .run(expiredAt, id);
       row.status = "expired";
+      row.updated_at = expiredAt;
     }
     return row;
   }

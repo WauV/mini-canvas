@@ -4,7 +4,6 @@ import {
   type DocumentSnapshot,
   type SaveDocumentOptions,
 } from "./types.ts";
-import type { LocalStorageDocumentRepository } from "./local-storage-repository.ts";
 import {
   type CommitDraftResult,
   type CommitPreview,
@@ -36,16 +35,37 @@ function numericVersion(value: string): number {
   return version;
 }
 
+export type DocumentRecoveryStore = Pick<
+  DocumentRepository,
+  "backup" | "loadRecovery" | "clearRecovery"
+>;
+
+export class MemoryDocumentRecoveryStore implements DocumentRecoveryStore {
+  private recovery: DocumentSnapshot | null = null;
+
+  async backup(document: DocumentSnapshot): Promise<void> {
+    this.recovery = { ...document };
+  }
+
+  async loadRecovery(): Promise<DocumentSnapshot | null> {
+    return this.recovery ? { ...this.recovery } : null;
+  }
+
+  async clearRecovery(): Promise<void> {
+    this.recovery = null;
+  }
+}
+
 export class McpDraftDocumentRepository implements DocumentRepository {
   private readonly client: MiniCanvasMcpClient;
-  private readonly recovery: LocalStorageDocumentRepository;
+  private readonly recovery: DocumentRecoveryStore;
   private currentDraft: DraftSnapshot;
   private readonly onDraftChange?: (draft: DraftSnapshot) => void;
 
   constructor(options: {
     client: MiniCanvasMcpClient;
     draft: DraftSnapshot;
-    recovery: LocalStorageDocumentRepository;
+    recovery: DocumentRecoveryStore;
     onDraftChange?: (draft: DraftSnapshot) => void;
   }) {
     this.client = options.client;

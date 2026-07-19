@@ -35,7 +35,8 @@ import {
   type EditorAction,
   type TextEdit,
 } from "../lib/editor-actions";
-import { obsidianLivePreview } from "../lib/live-preview";
+import { createObsidianLivePreview } from "../lib/live-preview";
+import type { LivePreviewInteractions } from "../lib/obsidian-interactions";
 
 export type EditorMode = "live" | "source";
 
@@ -44,6 +45,7 @@ type EditorProps = {
   mode: EditorMode;
   onChange: (content: string) => void;
   readOnly?: boolean;
+  livePreviewInteractions?: LivePreviewInteractions;
 };
 
 type ToolbarItem = {
@@ -146,9 +148,14 @@ function runEditorAction(
   return true;
 }
 
-function modeExtensions(mode: EditorMode): Extension {
+const NO_LIVE_PREVIEW_INTERACTIONS: LivePreviewInteractions = {};
+
+function modeExtensions(
+  mode: EditorMode,
+  interactions: LivePreviewInteractions,
+): Extension {
   return mode === "live"
-    ? [obsidianLivePreview]
+    ? [createObsidianLivePreview(undefined, interactions)]
     : [lineNumbers(), EditorView.contentAttributes.of({ "data-mode": "source" })];
 }
 
@@ -200,12 +207,14 @@ export function Editor({
   mode,
   onChange,
   readOnly = false,
+  livePreviewInteractions = NO_LIVE_PREVIEW_INTERACTIONS,
 }: EditorProps) {
   const editorHostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
   const initialContentRef = useRef(content);
   const initialModeRef = useRef(mode);
+  const initialInteractionsRef = useRef(livePreviewInteractions);
   const initialReadOnlyRef = useRef(readOnly);
   const modeCompartmentRef = useRef(new Compartment());
   const readOnlyCompartmentRef = useRef(new Compartment());
@@ -257,7 +266,10 @@ export function Editor({
         ]),
         editorTheme,
         modeCompartmentRef.current.of(
-          modeExtensions(initialModeRef.current),
+          modeExtensions(
+            initialModeRef.current,
+            initialInteractionsRef.current,
+          ),
         ),
         readOnlyCompartmentRef.current.of([
           EditorState.readOnly.of(initialReadOnlyRef.current),
@@ -301,9 +313,11 @@ export function Editor({
     const view = viewRef.current;
     if (!view) return;
     view.dispatch({
-      effects: modeCompartmentRef.current.reconfigure(modeExtensions(mode)),
+      effects: modeCompartmentRef.current.reconfigure(
+        modeExtensions(mode, livePreviewInteractions),
+      ),
     });
-  }, [mode]);
+  }, [livePreviewInteractions, mode]);
 
   useEffect(() => {
     const view = viewRef.current;

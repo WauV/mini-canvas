@@ -12,16 +12,31 @@ export type BridgeConfig = {
 };
 
 export type BridgeServerConfig = BridgeConfig & {
-  host: "127.0.0.1";
+  host: "127.0.0.1" | "0.0.0.0";
   port: number;
   authToken: string;
   maxAttachmentBytes: number;
 };
 
-function parseEnvFile(path: string): Record<string, string> {
+function parseEnvFile(path: string, optional = false): Record<string, string> {
   const values: Record<string, string> = {};
 
-  for (const rawLine of readFileSync(path, "utf8").split(/\r?\n/u)) {
+  let source: string;
+  try {
+    source = readFileSync(path, "utf8");
+  } catch (error) {
+    if (
+      optional &&
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "ENOENT"
+    ) {
+      return values;
+    }
+    throw error;
+  }
+
+  for (const rawLine of source.split(/\r?\n/u)) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
 
@@ -45,6 +60,39 @@ function parseEnvFile(path: string): Record<string, string> {
   return values;
 }
 
+function processEnvironment(): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) values[key] = value;
+  }
+  return values;
+}
+
+function parseListenHost(
+  value: string | undefined,
+): "127.0.0.1" | "0.0.0.0" {
+  const host = value ?? "127.0.0.1";
+  if (host !== "127.0.0.1" && host !== "0.0.0.0") {
+    throw new Error("LIVESYNC_BRIDGE_HOST 必须是 127.0.0.1 或 0.0.0.0");
+  }
+  return host;
+}
+
+function parseCouchDbUrl(value: string): string {
+  const url = new URL(value);
+  if (
+    (url.protocol !== "http:" && url.protocol !== "https:") ||
+    url.username ||
+    url.password ||
+    url.pathname !== "/" ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error("COUCHDB_URL 必须是没有凭据和路径的 HTTP(S) 地址");
+  }
+  return url.toString().replace(/\/$/u, "");
+}
+
 function requireValue(values: Record<string, string>, key: string): string {
   const value = values[key];
   if (!value) throw new Error(`缺少配置项 ${key}`);
@@ -56,14 +104,26 @@ export function projectRootFromModule(): string {
 }
 
 export function loadBridgeConfig(projectRoot = projectRootFromModule()): BridgeConfig {
-  const couch = parseEnvFile(resolve(projectRoot, ".local", "couchdb.env"));
-  const liveSync = parseEnvFile(
-    resolve(projectRoot, ".local", "livesync-bridge.env"),
-  );
-  const port = requireValue(couch, "COUCHDB_PORT");
+  const environment = processEnvironment();
+  const couch = {
+    ...parseEnvFile(resolve(projectRoot, ".local", "couchdb.env"), true),
+    ...environment,
+  };
+  const liveSync = {
+    ...parseEnvFile(
+      resolve(projectRoot, ".local", "livesync-bridge.env"),
+      true,
+    ),
+    ...environment,
+  };
+  const couchDbUrl = couch.COUCHDB_URL
+    ? parseCouchDbUrl(couch.COUCHDB_URL)
+    : parseCouchDbUrl(
+        `http://127.0.0.1:${requireValue(couch, "COUCHDB_PORT")}`,
+      );
 
   return {
-    couchDbUrl: `http://127.0.0.1:${port}`,
+    couchDbUrl,
     database: requireValue(couch, "COUCHDB_DATABASE"),
     username: requireValue(couch, "COUCHDB_USER"),
     password: requireValue(couch, "COUCHDB_PASSWORD"),
@@ -76,9 +136,13 @@ export function loadBridgeConfig(projectRoot = projectRootFromModule()): BridgeC
 export function loadBridgeServerConfig(
   projectRoot = projectRootFromModule(),
 ): BridgeServerConfig {
-  const liveSync = parseEnvFile(
-    resolve(projectRoot, ".local", "livesync-bridge.env"),
-  );
+  const liveSync = {
+    ...parseEnvFile(
+      resolve(projectRoot, ".local", "livesync-bridge.env"),
+      true,
+    ),
+    ...processEnvironment(),
+  };
   const port = Number(liveSync.LIVESYNC_BRIDGE_PORT ?? "3210");
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new Error("LIVESYNC_BRIDGE_PORT 必须是 1 到 65535 之间的整数");
@@ -92,7 +156,7 @@ export function loadBridgeServerConfig(
 
   return {
     ...loadBridgeConfig(projectRoot),
-    host: "127.0.0.1",
+    host: parseListenHost(liveSync.LIVESYNC_BRIDGE_HOST),
     port,
     authToken: requireValue(liveSync, "LIVESYNC_BRIDGE_TOKEN"),
     maxAttachmentBytes,

@@ -3,8 +3,9 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 
 export const dynamic = "force-dynamic";
 
-const EDITOR_TOOLS = new Set([
+export const EDITOR_TOOLS = new Set([
   "list_entries",
+  "read_attachment",
   "create_draft",
   "get_draft",
   "update_draft",

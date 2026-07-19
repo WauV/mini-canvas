@@ -1,3 +1,5 @@
+import { parseObsidianLink } from "./obsidian-links.ts";
+
 export type TextRange = {
   from: number;
   to: number;
@@ -514,6 +516,21 @@ function parseLineTokens(
       continue;
     }
 
+    // A spaced thematic break such as "- - -" also begins with a list
+    // marker, so it must be recognized before the generic bullet branch.
+    if (
+      /^\s{0,3}((\*\s*){3,}|(-\s*){3,}|(_\s*){3,})\s*$/.test(
+        line.text,
+      )
+    ) {
+      tokens.push({
+        kind: "horizontal-rule",
+        from: line.from,
+        to: line.to,
+      });
+      continue;
+    }
+
     const bulletMatch = line.text.match(/^(\s*)([-*+])(\s+)/);
     if (bulletMatch) {
       const markerTo =
@@ -551,17 +568,6 @@ function parseLineTokens(
       continue;
     }
 
-    if (
-      /^\s{0,3}((\*\s*){3,}|(-\s*){3,}|(_\s*){3,})\s*$/.test(
-        line.text,
-      )
-    ) {
-      tokens.push({
-        kind: "horizontal-rule",
-        from: line.from,
-        to: line.to,
-      });
-    }
   }
 }
 
@@ -622,17 +628,21 @@ function parseInlineTokens(
       kind: "wiki-link",
       expression: /(!?)\[\[([^\]\n]+)\]\]/g,
       getToken: (match, from) => {
-        const body = match[2];
-        const parts = body.split("|");
-        const target = parts[0];
-        const label = parts.slice(1).join("|") || target;
+        const link = parseObsidianLink(match[2], { embed: Boolean(match[1]) });
         return {
           kind: match[1] ? "embed" : "wiki-link",
           from,
           to: from + match[0].length,
           contentFrom: from + match[1].length + 2,
           contentTo: from + match[0].length - 2,
-          data: { target, label },
+          data: {
+            target: link.target,
+            path: link.path,
+            subpath: link.subpath,
+            label: link.label,
+            ...(link.width ? { width: link.width } : {}),
+            ...(link.height ? { height: link.height } : {}),
+          },
         };
       },
     },

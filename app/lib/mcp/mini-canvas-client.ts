@@ -1,4 +1,10 @@
-import type { McpToolClient, McpToolResult } from "./tool-client.ts";
+import type {
+  McpDisplayMode,
+  McpImageContent,
+  McpToolClient,
+  McpToolResult,
+  McpToolResultListener,
+} from "./tool-client.ts";
 
 export type VaultNoteEntry = {
   path: string;
@@ -6,6 +12,32 @@ export type VaultNoteEntry = {
   mtime: number;
   size: number;
 };
+
+export type VaultEntryKind = "note" | "attachment";
+
+export type VaultEntry = VaultNoteEntry & {
+  kind: VaultEntryKind;
+  mimeType: string;
+  ctime: number;
+};
+
+export type ListVaultEntriesInput = {
+  prefix?: string;
+  kinds?: VaultEntryKind[];
+  extensions?: string[];
+  limit?: number;
+};
+
+export type ReadAttachmentResult = {
+  path: string;
+  mimeType: string;
+  revision: string;
+  size: number;
+} & (
+  | { delivery: "image"; data: string }
+  | { delivery: "text"; text: string }
+  | { delivery: "metadata_only" }
+);
 
 export type DraftStatus = "active" | "committed" | "expired";
 
@@ -108,6 +140,33 @@ function booleanField(value: Record<string, unknown>, key: string): boolean {
   return value[key] as boolean;
 }
 
+function parseVaultEntry(value: unknown): VaultEntry {
+  const entry = record(value, "Vault 条目");
+  const kind = stringField(entry, "kind");
+  if (kind !== "note" && kind !== "attachment") {
+    throw new McpServiceError("MCP Vault 条目类型无效");
+  }
+  return {
+    path: stringField(entry, "path"),
+    kind,
+    mimeType: stringField(entry, "mimeType"),
+    revision: stringField(entry, "revision"),
+    ctime: numberField(entry, "ctime"),
+    mtime: numberField(entry, "mtime"),
+    size: numberField(entry, "size"),
+  };
+}
+
+function isBase64(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value.length % 4 === 0 &&
+    /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(
+      value,
+    )
+  );
+}
+
 function parseDraft(value: unknown): DraftSnapshot {
   const item = record(value, "草稿工具");
   const status = stringField(item, "status");
@@ -196,32 +255,24 @@ export class MiniCanvasMcpClient {
     return result.structuredContent;
   }
 
-  async listNotes(): Promise<VaultNoteEntry[]> {
-    const notes: VaultNoteEntry[] = [];
+  async listEntries(input: ListVaultEntriesInput = {}): Promise<VaultEntry[]> {
+    const entries: VaultEntry[] = [];
     const seenCursors = new Set<string>();
     let cursor: string | undefined;
     do {
       const value = record(
         await this.structured("list_entries", {
-          kinds: ["note"],
-          extensions: [".md"],
-          limit: 200,
+          ...input,
+          limit: input.limit ?? 200,
           ...(cursor ? { cursor } : {}),
         }),
-        "笔记列表",
+        "Vault 列表",
       );
       if (!Array.isArray(value.entries)) {
-        throw new McpServiceError("MCP 笔记列表格式无效");
+        throw new McpServiceError("MCP Vault 列表格式无效");
       }
       for (const rawEntry of value.entries) {
-        const entry = record(rawEntry, "笔记条目");
-        if (entry.kind !== "note") continue;
-        notes.push({
-          path: stringField(entry, "path"),
-          revision: stringField(entry, "revision"),
-          mtime: numberField(entry, "mtime"),
-          size: numberField(entry, "size"),
-        });
+        entries.push(parseVaultEntry(rawEntry));
       }
       cursor = typeof value.nextCursor === "string" ? value.nextCursor : undefined;
       if (cursor) {
@@ -230,7 +281,53 @@ export class MiniCanvasMcpClient {
       }
     } while (cursor);
 
-    return notes.sort((left, right) => left.path.localeCompare(right.path, "zh-CN"));
+    return entries.sort((left, right) =>
+      left.path.localeCompare(right.path, "zh-CN"),
+    );
+  }
+
+  async listNotes(): Promise<VaultNoteEntry[]> {
+    return (await this.listEntries({ kinds: ["note"], extensions: [".md"] }))
+      .filter((entry) => entry.kind === "note")
+      .map(({ path, revision, mtime, size }) => ({ path, revision, mtime, size }));
+  }
+
+  async readAttachment(path: string): Promise<ReadAttachmentResult> {
+    const result = await this.tools.callTool("read_attachment", { path });
+    if (result.isError) throwToolError(result);
+    const value = record(result.structuredContent, "附件工具");
+    const common = {
+      path: stringField(value, "path"),
+      mimeType: stringField(value, "mimeType").split(";", 1)[0].toLowerCase(),
+      revision: stringField(value, "revision"),
+      size: numberField(value, "size"),
+    };
+    const delivery = stringField(value, "delivery");
+    if (delivery === "text") {
+      return { ...common, delivery, text: stringField(value, "text") };
+    }
+    if (delivery === "metadata_only") return { ...common, delivery };
+    if (delivery !== "image") {
+      throw new McpServiceError("MCP 附件交付类型无效");
+    }
+    const image = result.content?.find((item): item is McpImageContent => {
+      const candidate = item as Record<string, unknown>;
+      return (
+        candidate.type === "image" &&
+        typeof candidate.data === "string" &&
+        typeof candidate.mimeType === "string"
+      );
+    });
+    if (
+      !image ||
+      typeof image.data !== "string" ||
+      typeof image.mimeType !== "string" ||
+      image.mimeType.toLowerCase() !== common.mimeType ||
+      !isBase64(image.data)
+    ) {
+      throw new McpServiceError("MCP 图片附件内容无效");
+    }
+    return { ...common, delivery, data: image.data };
   }
 
   async createDraft(path: string): Promise<DraftSnapshot> {
@@ -273,6 +370,17 @@ export class MiniCanvasMcpClient {
         idempotentReplay: booleanField(note, "idempotentReplay"),
       },
     };
+  }
+
+  subscribeToolResults(listener: McpToolResultListener): () => void {
+    return this.tools.subscribeToolResults?.(listener) ?? (() => undefined);
+  }
+
+  async requestDisplayMode(mode: McpDisplayMode): Promise<McpDisplayMode> {
+    if (!this.tools.requestDisplayMode) {
+      throw new McpServiceError("当前宿主不支持切换 Widget 展示模式");
+    }
+    return this.tools.requestDisplayMode(mode);
   }
 
   close(): void {

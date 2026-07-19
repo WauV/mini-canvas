@@ -29,7 +29,11 @@
     "app/**/*.tsx",
     "tests/**/*.ts",
     "scripts/**/*.ts",
+    "widget/**/*.ts",
+    "widget/**/*.tsx",
     "vite.config.ts",
+    "vite.widget.config.ts",
+    "vitest.config.ts",
     "vinext.config.ts",
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts"

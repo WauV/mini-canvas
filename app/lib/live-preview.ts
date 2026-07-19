@@ -6,6 +6,12 @@ import {
   WidgetType,
 } from "@codemirror/view";
 import katex from "katex";
+import type {
+  EmbedResolutionRequest,
+  LivePreviewInteractions,
+  ResolvedEmbed,
+  WikiLinkNavigationRequest,
+} from "./obsidian-interactions.ts";
 import {
   type MarkdownLine,
   type ObsidianToken,
@@ -144,58 +150,317 @@ class SvgWidget extends WidgetType {
   }
 }
 
+function editSourceButton(
+  view: EditorView,
+  from: number,
+  to: number,
+  offset: number,
+): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "cm-widget-edit-source";
+  button.textContent = "编辑";
+  button.title = "编辑 Markdown 源码";
+  button.addEventListener("mousedown", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    focusSource(view, from, to, offset);
+  });
+  return button;
+}
+
 class WikiLinkWidget extends WidgetType {
   readonly target: string;
+  readonly path: string;
+  readonly subpath: string;
   readonly label: string;
-  readonly embed: boolean;
   readonly from: number;
   readonly to: number;
+  readonly interactions: LivePreviewInteractions;
 
   constructor(
     target: string,
+    path: string,
+    subpath: string,
     label: string,
-    embed: boolean,
     from: number,
     to: number,
+    interactions: LivePreviewInteractions,
   ) {
     super();
     this.target = target;
+    this.path = path;
+    this.subpath = subpath;
     this.label = label;
-    this.embed = embed;
     this.from = from;
     this.to = to;
+    this.interactions = interactions;
   }
 
   eq(other: WikiLinkWidget): boolean {
     return (
       this.target === other.target &&
+      this.path === other.path &&
+      this.subpath === other.subpath &&
       this.label === other.label &&
-      this.embed === other.embed &&
       this.from === other.from &&
-      this.to === other.to
+      this.to === other.to &&
+      this.interactions === other.interactions
     );
   }
 
   toDOM(view: EditorView): HTMLElement {
-    const element = document.createElement("span");
-    element.className = this.embed
-      ? "cm-obsidian-embed-widget"
-      : "cm-obsidian-wikilink-widget";
-    element.title = this.target + " · 点击编辑源文本";
+    const wrapper = document.createElement("span");
+    wrapper.className = "cm-obsidian-wikilink-widget";
+    wrapper.dataset.target = this.target;
+
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "cm-wikilink-open";
+    open.title = this.target + (this.interactions.openWikiLink ? " · 点击打开" : "");
+    open.setAttribute("aria-label", `打开 Wiki Link：${this.label}`);
 
     const icon = document.createElement("span");
     icon.className = "cm-widget-icon";
-    icon.textContent = this.embed ? "▣" : "↗";
-
+    icon.textContent = "↗";
     const label = document.createElement("span");
-    label.textContent = this.embed ? "嵌入 · " + this.label : this.label;
+    label.textContent = this.label;
+    open.append(icon, label);
 
-    element.append(icon, label);
-    element.addEventListener("mousedown", (event) => {
+    const request: WikiLinkNavigationRequest = {
+      target: this.target,
+      path: this.path,
+      subpath: this.subpath,
+      label: this.label,
+    };
+    open.addEventListener("mousedown", (event) => {
       event.preventDefault();
-      focusSource(view, this.from, this.to, this.embed ? 3 : 2);
+      event.stopPropagation();
     });
-    return element;
+    open.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const handler = this.interactions.openWikiLink;
+      if (!handler) {
+        focusSource(view, this.from, this.to, 2);
+        return;
+      }
+      wrapper.classList.add("is-opening");
+      void (async () => handler(request))()
+        .catch((error: unknown) => {
+          wrapper.classList.add("has-error");
+          wrapper.title = error instanceof Error ? error.message : "Wiki Link 打开失败";
+        })
+        .finally(() => wrapper.classList.remove("is-opening"));
+    });
+
+    wrapper.append(
+      open,
+      editSourceButton(view, this.from, this.to, 2),
+    );
+    if (!this.interactions.openWikiLink) {
+      wrapper.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        focusSource(view, this.from, this.to, 2);
+      });
+    }
+    return wrapper;
+  }
+
+  ignoreEvent(): boolean {
+    return false;
+  }
+}
+
+function renderEmbedResolution(
+  wrapper: HTMLElement,
+  content: HTMLElement,
+  resolution: ResolvedEmbed,
+  request: EmbedResolutionRequest,
+  interactions: LivePreviewInteractions,
+): void {
+  content.replaceChildren();
+  wrapper.classList.remove("is-loading", "has-error");
+  wrapper.classList.add(`is-${resolution.kind}`);
+  wrapper.dataset.resolvedPath = resolution.path;
+
+  if (resolution.kind === "image") {
+    const image = document.createElement("img");
+    image.className = "cm-resolved-embed-image";
+    image.src = resolution.source;
+    image.alt = request.label || resolution.path;
+    image.draggable = false;
+    if (request.width) image.style.width = `${request.width}px`;
+    if (request.height) image.style.height = `${request.height}px`;
+    content.appendChild(image);
+    return;
+  }
+
+  if (resolution.kind === "svg") {
+    const sanitized = sanitizeSvgMarkup(resolution.source);
+    if (!sanitized.markup) {
+      throw new Error(sanitized.error ?? "SVG 无法预览");
+    }
+    const objectUrl = URL.createObjectURL(
+      new Blob([sanitized.markup], { type: "image/svg+xml" }),
+    );
+    wrapper.dataset.svgObjectUrl = objectUrl;
+    const image = document.createElement("img");
+    image.className = "cm-resolved-embed-image";
+    image.src = objectUrl;
+    image.alt = request.label || resolution.path;
+    image.draggable = false;
+    if (request.width) image.style.width = `${request.width}px`;
+    if (request.height) image.style.height = `${request.height}px`;
+    content.appendChild(image);
+    return;
+  }
+
+  if (resolution.kind === "text") {
+    const previewLimit = 20_000;
+    const preview = document.createElement("pre");
+    preview.className = "cm-resolved-embed-text";
+    preview.textContent = resolution.source.slice(0, previewLimit);
+    content.appendChild(preview);
+    if (resolution.source.length > previewLimit) {
+      const truncated = document.createElement("span");
+      truncated.className = "cm-embed-status";
+      truncated.textContent = "预览已截断，源文件未改变";
+      content.appendChild(truncated);
+    }
+    return;
+  }
+
+  const message = document.createElement("span");
+  message.className = "cm-embed-status";
+  if (resolution.kind === "note") {
+    message.textContent = `笔记嵌入 · ${resolution.path}`;
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "cm-embed-open-note";
+    open.textContent = "打开笔记";
+    open.disabled = !interactions.openWikiLink;
+    open.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    });
+    open.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const handler = interactions.openWikiLink;
+      if (!handler) return;
+      void (async () => handler(request))().catch((error: unknown) => {
+        wrapper.classList.add("has-error");
+        wrapper.title = error instanceof Error ? error.message : "笔记打开失败";
+      });
+    });
+    content.append(message, open);
+    return;
+  }
+  message.textContent = `此附件只提供元数据 · ${resolution.mimeType}`;
+  content.appendChild(message);
+}
+
+class EmbedWidget extends WidgetType {
+  readonly request: EmbedResolutionRequest;
+  readonly from: number;
+  readonly to: number;
+  readonly interactions: LivePreviewInteractions;
+
+  constructor(
+    request: EmbedResolutionRequest,
+    from: number,
+    to: number,
+    interactions: LivePreviewInteractions,
+  ) {
+    super();
+    this.request = request;
+    this.from = from;
+    this.to = to;
+    this.interactions = interactions;
+  }
+
+  eq(other: EmbedWidget): boolean {
+    return (
+      JSON.stringify(this.request) === JSON.stringify(other.request) &&
+      this.from === other.from &&
+      this.to === other.to &&
+      this.interactions === other.interactions
+    );
+  }
+
+  toDOM(view: EditorView): HTMLElement {
+    const wrapper = document.createElement("span");
+    wrapper.className = "cm-obsidian-embed-widget is-loading";
+    wrapper.dataset.target = this.request.target;
+
+    const header = document.createElement("span");
+    header.className = "cm-embed-header";
+    const icon = document.createElement("span");
+    icon.className = "cm-widget-icon";
+    icon.textContent = "▣";
+    const label = document.createElement("span");
+    label.className = "cm-embed-label";
+    label.textContent = this.request.label || this.request.path;
+    header.append(
+      icon,
+      label,
+      editSourceButton(view, this.from, this.to, 3),
+    );
+
+    const content = document.createElement("span");
+    content.className = "cm-embed-content";
+    content.setAttribute("aria-live", "polite");
+    const status = document.createElement("span");
+    status.className = "cm-embed-status";
+    status.textContent = this.interactions.resolveEmbed
+      ? "正在读取附件…"
+      : "附件预览尚未连接";
+    content.appendChild(status);
+    wrapper.append(header, content);
+
+    const resolver = this.interactions.resolveEmbed;
+    if (!resolver) {
+      wrapper.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        focusSource(view, this.from, this.to, 3);
+      });
+      return wrapper;
+    }
+
+    void resolver(this.request)
+      .then((resolution) => {
+        if (wrapper.dataset.disposed === "true") return;
+        renderEmbedResolution(
+          wrapper,
+          content,
+          resolution,
+          this.request,
+          this.interactions,
+        );
+      })
+      .catch((error: unknown) => {
+        if (wrapper.dataset.disposed === "true") return;
+        wrapper.classList.remove("is-loading");
+        wrapper.classList.add("has-error");
+        content.replaceChildren();
+        const detail = document.createElement("span");
+        detail.className = "cm-embed-status";
+        detail.textContent =
+          error instanceof Error ? error.message : "附件预览加载失败";
+        content.appendChild(detail);
+      });
+    return wrapper;
+  }
+
+  destroy(dom: HTMLElement): void {
+    dom.dataset.disposed = "true";
+    const objectUrl = dom.dataset.svgObjectUrl;
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
   }
 
   ignoreEvent(): boolean {
@@ -561,6 +826,7 @@ function tokenBooleanData(
 function buildDecorations(
   state: EditorState,
   parsed: ParsedObsidianMarkdown,
+  interactions: LivePreviewInteractions,
 ): DecorationSet {
   const ranges: Range<Decoration>[] = [];
 
@@ -838,28 +1104,65 @@ function buildDecorations(
         break;
       }
 
-      case "wiki-link":
-      case "embed": {
+      case "wiki-link": {
         if (!active) {
           ranges.push(
             Decoration.replace({
               widget: new WikiLinkWidget(
                 tokenTextData(token, "target"),
+                tokenTextData(token, "path", tokenTextData(token, "target")),
+                tokenTextData(token, "subpath"),
                 tokenTextData(token, "label"),
-                token.kind === "embed",
                 token.from,
                 token.to,
+                interactions,
               ),
             }).range(token.from, token.to),
           );
         } else {
           ranges.push(
-            Decoration.mark({
-              class:
-                token.kind === "embed"
-                  ? "cm-embed-source"
-                  : "cm-wikilink-source",
+            Decoration.mark({ class: "cm-wikilink-source" }).range(
+              token.from,
+              token.to,
+            ),
+          );
+        }
+        break;
+      }
+
+      case "embed": {
+        if (!active) {
+          ranges.push(
+            Decoration.replace({
+              widget: new EmbedWidget(
+                {
+                  target: tokenTextData(token, "target"),
+                  path: tokenTextData(
+                    token,
+                    "path",
+                    tokenTextData(token, "target"),
+                  ),
+                  subpath: tokenTextData(token, "subpath"),
+                  label: tokenTextData(token, "label"),
+                  ...(tokenNumberData(token, "width") > 0
+                    ? { width: tokenNumberData(token, "width") }
+                    : {}),
+                  ...(tokenNumberData(token, "height") > 0
+                    ? { height: tokenNumberData(token, "height") }
+                    : {}),
+                },
+                token.from,
+                token.to,
+                interactions,
+              ),
             }).range(token.from, token.to),
+          );
+        } else {
+          ranges.push(
+            Decoration.mark({ class: "cm-embed-source" }).range(
+              token.from,
+              token.to,
+            ),
           );
         }
         break;
@@ -1020,13 +1323,14 @@ export type ObsidianMarkdownParser = (
 
 export function createObsidianLivePreview(
   parser: ObsidianMarkdownParser = parseObsidianMarkdown,
+  interactions: LivePreviewInteractions = {},
 ): StateField<LivePreviewState> {
   return StateField.define<LivePreviewState>({
     create(state) {
       const parsed = parser(state.doc.toString());
       return {
         parsed,
-        decorations: buildDecorations(state, parsed),
+        decorations: buildDecorations(state, parsed, interactions),
       };
     },
     update(value, transaction) {
@@ -1040,7 +1344,7 @@ export function createObsidianLivePreview(
         : value.parsed;
       return {
         parsed,
-        decorations: buildDecorations(transaction.state, parsed),
+        decorations: buildDecorations(transaction.state, parsed, interactions),
       };
     },
     provide(field) {

@@ -153,6 +153,84 @@ function preferredLineEnding(value: string): "\n" | "\r\n" {
   return firstLineEnding === "\r\n" ? "\r\n" : "\n";
 }
 
+type SourceLine = {
+  from: number;
+  to: number;
+  breakTo: number;
+  text: string;
+};
+
+function sourceLines(value: string): SourceLine[] {
+  const lines: SourceLine[] = [];
+  let from = 0;
+  while (from <= value.length) {
+    const newline = value.indexOf("\n", from);
+    const breakTo = newline < 0 ? value.length : newline + 1;
+    const rawTo = newline < 0 ? value.length : newline;
+    const to = rawTo > from && value[rawTo - 1] === "\r" ? rawTo - 1 : rawTo;
+    lines.push({ from, to, breakTo, text: value.slice(from, to) });
+    if (newline < 0) break;
+    from = newline + 1;
+  }
+  return lines;
+}
+
+function toggleCodeBlock(
+  value: string,
+  start: number,
+  end: number,
+): TextEdit {
+  let opening:
+    | { line: SourceLine; marker: string }
+    | null = null;
+
+  for (const line of sourceLines(value)) {
+    const fence = line.text.match(/^[ \t]{0,3}(`{3,}|~{3,})([^\r\n]*)$/u);
+    if (!opening) {
+      if (fence) opening = { line, marker: fence[1] };
+      continue;
+    }
+
+    const closing = line.text.match(/^[ \t]{0,3}(`{3,}|~{3,})[ \t]*$/u);
+    if (
+      !closing ||
+      closing[1][0] !== opening.marker[0] ||
+      closing[1].length < opening.marker.length
+    ) {
+      continue;
+    }
+
+    if (start >= opening.line.from && end <= line.to) {
+      let content = value.slice(opening.line.breakTo, line.from);
+      const lineEnding = preferredLineEnding(content);
+      if (content.endsWith(lineEnding)) {
+        content = content.slice(0, -lineEnding.length);
+      }
+      const nextStart = opening.line.from;
+      return {
+        value:
+          value.slice(0, opening.line.from) +
+          content +
+          value.slice(line.to),
+        selectionStart: nextStart,
+        selectionEnd: nextStart + content.length,
+      };
+    }
+
+    opening = null;
+  }
+
+  const lineEnding = preferredLineEnding(value);
+  return toggleWrapSelection(
+    value,
+    start,
+    end,
+    CODE_FENCE + lineEnding,
+    lineEnding + CODE_FENCE,
+    "在这里输入代码",
+  );
+}
+
 function createFootnote(
   value: string,
   start: number,
@@ -248,14 +326,7 @@ export function applyEditorAction(
         "code",
       );
     case "code-block":
-      return toggleWrapSelection(
-        value,
-        start,
-        end,
-        CODE_FENCE + "\n",
-        "\n" + CODE_FENCE,
-        "在这里输入代码",
-      );
+      return toggleCodeBlock(value, start, end);
     case "link":
       return toggleWrapSelection(
         value,

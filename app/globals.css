@@ -389,6 +389,24 @@ button {
   box-shadow: var(--shadow);
 }
 
+.canvas-shell.is-widget {
+  min-height: 100dvh;
+  padding: 10px;
+}
+
+.is-widget .canvas-header,
+.is-widget .view-bar,
+.is-widget .workspace {
+  width: 100%;
+}
+
+.is-widget .workspace {
+  height: calc(100dvh - 123px);
+  min-height: 420px;
+  border-radius: 14px;
+  box-shadow: 0 14px 42px rgba(76, 61, 49, 0.11);
+}
+
 .workspace-panel {
   min-width: 0;
   min-height: 0;
@@ -542,6 +560,13 @@ button {
   max-height: min(520px, calc(100dvh - 220px));
   overflow: auto;
   padding: 0 14px 16px;
+  margin: 0;
+  list-style: none;
+}
+
+.note-list-entry {
+  margin: 0;
+  padding: 0;
 }
 
 .note-list-item {
@@ -896,13 +921,159 @@ button {
   font-weight: 650;
 }
 
+.cm-wikilink-open,
+.cm-widget-edit-source,
+.cm-embed-open-note {
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.cm-wikilink-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+}
+
+.cm-wikilink-open:focus-visible,
+.cm-widget-edit-source:focus-visible,
+.cm-embed-open-note:focus-visible {
+  outline: 2px solid var(--line-focus);
+  outline-offset: 2px;
+}
+
+.cm-widget-edit-source {
+  margin-left: 3px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 500;
+  opacity: 0;
+  transition: opacity 120ms ease, background-color 120ms ease;
+}
+
+.cm-obsidian-wikilink-widget:hover .cm-widget-edit-source,
+.cm-obsidian-embed-widget:hover .cm-widget-edit-source,
+.cm-widget-edit-source:focus-visible {
+  opacity: 1;
+}
+
+.cm-widget-edit-source:hover {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.cm-obsidian-wikilink-widget.is-opening {
+  opacity: 0.68;
+}
+
+.cm-obsidian-wikilink-widget.has-error {
+  color: var(--danger);
+}
+
 .cm-obsidian-embed-widget {
-  padding: 0.2em 0.58em;
+  display: inline-flex;
+  width: min(100%, 720px);
+  min-width: min(280px, 100%);
+  margin: 0.35em 0;
+  padding: 0;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 7px;
+  border-radius: 10px;
   color: var(--muted);
   background: var(--surface-embed);
   font-size: 0.88em;
+  vertical-align: top;
+  cursor: default;
+}
+
+.cm-embed-header {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface-embed) 84%, var(--surface-code));
+}
+
+.cm-embed-label {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cm-embed-content {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+}
+
+.cm-embed-status {
+  display: block;
+  padding: 12px 14px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.cm-obsidian-embed-widget.has-error {
+  border-color: color-mix(in srgb, var(--danger) 38%, var(--line));
+}
+
+.cm-obsidian-embed-widget.has-error .cm-embed-status {
+  color: var(--danger);
+}
+
+.cm-resolved-embed-image {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  max-height: 70vh;
+  object-fit: contain;
+}
+
+.cm-resolved-embed-text {
+  width: 100%;
+  max-height: 360px;
+  margin: 0;
+  padding: 14px 16px;
+  overflow: auto;
+  color: var(--text);
+  background: var(--surface-code);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  line-height: 1.65;
+  text-align: left;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.cm-embed-open-note {
+  margin: 8px 12px 8px 0;
+  padding: 4px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  color: var(--accent-dark);
+  background: var(--surface);
+}
+
+.cm-embed-open-note:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 .cm-widget-icon {
@@ -1258,6 +1429,14 @@ button {
     padding: 3px 0 9px;
   }
 
+  .is-widget .canvas-header {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .is-widget .brand-group {
+    display: none;
+  }
+
   .brand-mark {
     width: 37px;
     height: 37px;
@@ -1305,6 +1484,10 @@ button {
     height: calc(100dvh - 102px);
     min-height: 0;
     border-radius: 14px;
+  }
+
+  .is-widget .workspace {
+    height: calc(100dvh - 93px);
   }
 
   .editor-toolbar {

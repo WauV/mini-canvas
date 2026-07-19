@@ -6,8 +6,9 @@ import type { StaticTokenRecord } from "./auth.ts";
 import { MCP_SCOPES, type McpScope, type Principal } from "./types.ts";
 
 export type McpConfig = {
-  host: "127.0.0.1";
+  host: "127.0.0.1" | "0.0.0.0";
   port: number;
+  allowedHosts: string[];
   databasePath: string;
   masterKey: Buffer;
   tokens: StaticTokenRecord[];
@@ -17,9 +18,23 @@ export type McpConfig = {
   caseInsensitivePaths: boolean;
 };
 
-function parseEnvFile(path: string): Record<string, string> {
+function parseEnvFile(path: string, optional = false): Record<string, string> {
   const values: Record<string, string> = {};
-  for (const rawLine of readFileSync(path, "utf8").split(/\r?\n/u)) {
+  let source: string;
+  try {
+    source = readFileSync(path, "utf8");
+  } catch (error) {
+    if (
+      optional &&
+      error instanceof Error &&
+      "code" in error &&
+      error.code === "ENOENT"
+    ) {
+      return values;
+    }
+    throw error;
+  }
+  for (const rawLine of source.split(/\r?\n/u)) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
     const separator = line.indexOf("=");
@@ -36,6 +51,65 @@ function parseEnvFile(path: string): Record<string, string> {
     values[key] = value;
   }
   return values;
+}
+
+function processEnvironment(): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) values[key] = value;
+  }
+  return values;
+}
+
+function parseListenHost(
+  value: string | undefined,
+): "127.0.0.1" | "0.0.0.0" {
+  const host = value ?? "127.0.0.1";
+  if (host !== "127.0.0.1" && host !== "0.0.0.0") {
+    throw new Error("MINI_CANVAS_MCP_HOST 必须是 127.0.0.1 或 0.0.0.0");
+  }
+  return host;
+}
+
+function parseAllowedHosts(
+  value: string | undefined,
+  host: "127.0.0.1" | "0.0.0.0",
+): string[] {
+  if (!value) {
+    if (host === "0.0.0.0") {
+      throw new Error(
+        "MINI_CANVAS_MCP_HOST=0.0.0.0 时必须配置 MINI_CANVAS_MCP_ALLOWED_HOSTS",
+      );
+    }
+    return ["127.0.0.1", "localhost", "[::1]"];
+  }
+  const allowedHosts = [...new Set(value.split(",").map((item) => item.trim()))]
+    .filter(Boolean);
+  if (
+    allowedHosts.length === 0 ||
+    allowedHosts.some((item) =>
+      item.startsWith("[") && item.endsWith("]")
+        ? !/^\[[0-9a-f:]+\]$/iu.test(item)
+        : !/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/iu.test(item),
+    )
+  ) {
+    throw new Error("MINI_CANVAS_MCP_ALLOWED_HOSTS 必须是逗号分隔且不含端口的主机名");
+  }
+  return allowedHosts;
+}
+
+function parseBridgeUrl(value: string): string {
+  const url = new URL(value);
+  if (
+    (url.protocol !== "http:" && url.protocol !== "https:") ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error("MINI_CANVAS_BRIDGE_URL 必须是没有凭据的 HTTP(S) 地址");
+  }
+  return url.toString().replace(/\/$/u, "");
 }
 
 function requireValue(values: Record<string, string>, key: string): string {
@@ -85,7 +159,10 @@ export function projectRootFromMcpModule(): string {
 }
 
 export function loadMcpConfig(projectRoot = projectRootFromMcpModule()): McpConfig {
-  const values = parseEnvFile(resolve(projectRoot, ".local", "mcp-server.env"));
+  const values = {
+    ...parseEnvFile(resolve(projectRoot, ".local", "mcp-server.env"), true),
+    ...processEnvironment(),
+  };
   const port = Number(values.MINI_CANVAS_MCP_PORT ?? "3220");
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new Error("MINI_CANVAS_MCP_PORT 必须是 1 到 65535 之间的整数");
@@ -101,17 +178,21 @@ export function loadMcpConfig(projectRoot = projectRootFromMcpModule()): McpConf
   if (masterKey.byteLength !== 32) {
     throw new Error("MINI_CANVAS_MCP_MASTER_KEY_BASE64 解码后必须是 32 bytes");
   }
-  const bridgeUrl = new URL(requireValue(values, "MINI_CANVAS_BRIDGE_URL"));
-  if (bridgeUrl.protocol !== "http:" || bridgeUrl.hostname !== "127.0.0.1") {
-    throw new Error("本地阶段 MINI_CANVAS_BRIDGE_URL 必须指向 http://127.0.0.1");
-  }
+  const bridgeUrl = parseBridgeUrl(
+    requireValue(values, "MINI_CANVAS_BRIDGE_URL"),
+  );
+  const host = parseListenHost(values.MINI_CANVAS_MCP_HOST);
   return {
-    host: "127.0.0.1",
+    host,
     port,
+    allowedHosts: parseAllowedHosts(
+      values.MINI_CANVAS_MCP_ALLOWED_HOSTS,
+      host,
+    ),
     databasePath,
     masterKey,
     tokens: parseTokens(requireValue(values, "MINI_CANVAS_MCP_AUTH_JSON")),
-    bridgeUrl: bridgeUrl.toString().replace(/\/$/u, ""),
+    bridgeUrl,
     bridgeToken: requireValue(values, "MINI_CANVAS_BRIDGE_TOKEN"),
     autoIndex: (values.MINI_CANVAS_MCP_AUTO_INDEX ?? "true").toLowerCase() === "true",
     caseInsensitivePaths:

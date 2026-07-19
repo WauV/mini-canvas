@@ -1,5 +1,6 @@
 import { extname } from "node:path";
 
+import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
 
@@ -12,6 +13,10 @@ import {
 } from "./drafts.ts";
 import { MiniCanvasService, SearchNotReadyError } from "./service.ts";
 import type { Principal } from "./types.ts";
+import {
+  MINI_CANVAS_WIDGET_URI,
+  registerMiniCanvasWidget,
+} from "./widget.ts";
 
 const draftOutputSchema = {
   id: z.string(),
@@ -48,6 +53,12 @@ const localWriteAnnotations = {
   openWorldHint: false,
   destructiveHint: false,
 };
+
+// ChatGPT reaches this personal test-Vault server through a bound Secure MCP
+// Tunnel. The Tunnel authenticates to the local MCP with a private static
+// Bearer token, while the public App surface itself intentionally uses no OAuth.
+const noAuthSecuritySchemes = [{ type: "noauth" as const }];
+const noAuthToolMeta = { securitySchemes: noAuthSecuritySchemes };
 
 function publicError(error: unknown): string {
   if (
@@ -129,6 +140,81 @@ export function createMiniCanvasMcpServer(
     },
   );
 
+  registerMiniCanvasWidget(server);
+
+  registerAppTool(
+    server,
+    "open_mini_canvas",
+    {
+      title: "Open Mini Canvas",
+      description:
+        "Open the Mini Canvas editor. Optionally open an existing authorized Markdown note as an encrypted draft.",
+      inputSchema: {
+        path: z.string().optional(),
+      },
+      outputSchema: {
+        mode: z.enum(["picker", "draft"]),
+        draftId: z.string().optional(),
+        path: z.string().optional(),
+        title: z.string().optional(),
+        version: z.number().int().optional(),
+        status: z.enum(["active", "committed", "expired"]).optional(),
+        baseRevision: z.string().optional(),
+      },
+      annotations: localWriteAnnotations,
+      _meta: {
+        securitySchemes: noAuthSecuritySchemes,
+        ui: {
+          resourceUri: MINI_CANVAS_WIDGET_URI,
+          visibility: ["model", "app"],
+        },
+        "openai/outputTemplate": MINI_CANVAS_WIDGET_URI,
+        "openai/toolInvocation/invoking": "正在打开 Mini Canvas…",
+        "openai/toolInvocation/invoked": "Mini Canvas 已打开",
+      },
+    },
+    async ({ path }) => {
+      try {
+        if (!path) {
+          return {
+            structuredContent: { mode: "picker" as const },
+            content: [
+              {
+                type: "text" as const,
+                text: "Mini Canvas 已打开，请在 Widget 中选择一篇 Obsidian 笔记。",
+              },
+            ],
+          };
+        }
+
+        const draft = await service.createDraft(principal, { path });
+        const structuredContent = {
+          mode: "draft" as const,
+          draftId: draft.id,
+          path: draft.path,
+          title: draft.path.split("/").at(-1)?.replace(/\.md$/iu, "") ?? draft.path,
+          version: draft.version,
+          status: draft.status,
+          baseRevision: draft.baseRevision,
+        };
+        return {
+          structuredContent,
+          content: [
+            {
+              type: "text" as const,
+              text: `Mini Canvas 已打开加密草稿：${draft.path}（v${draft.version}）。`,
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: publicError(error) }],
+        };
+      }
+    },
+  );
+
   server.registerTool(
     "list_entries",
     {
@@ -147,6 +233,7 @@ export function createMiniCanvasMcpServer(
         baselineSequence: z.string(),
       },
       annotations: readOnlyAnnotations,
+      _meta: noAuthToolMeta,
     },
     async (input) =>
       toolResult(
@@ -171,6 +258,7 @@ export function createMiniCanvasMcpServer(
         text: z.string().optional(),
       },
       annotations: readOnlyAnnotations,
+      _meta: noAuthToolMeta,
     },
     async ({ path }) => {
       try {
@@ -244,6 +332,7 @@ export function createMiniCanvasMcpServer(
       },
       outputSchema: draftOutputSchema,
       annotations: localWriteAnnotations,
+      _meta: noAuthToolMeta,
     },
     async (input) =>
       toolResult(
@@ -260,6 +349,7 @@ export function createMiniCanvasMcpServer(
       inputSchema: { draftId: z.string().uuid() },
       outputSchema: draftOutputSchema,
       annotations: readOnlyAnnotations,
+      _meta: noAuthToolMeta,
     },
     async ({ draftId }) =>
       toolResult(
@@ -280,6 +370,7 @@ export function createMiniCanvasMcpServer(
       },
       outputSchema: draftOutputSchema,
       annotations: localWriteAnnotations,
+      _meta: noAuthToolMeta,
     },
     async (input) =>
       toolResult(
@@ -308,6 +399,7 @@ export function createMiniCanvasMcpServer(
         contentSha256: z.string(),
       },
       annotations: readOnlyAnnotations,
+      _meta: noAuthToolMeta,
     },
     async (input) =>
       toolResult(
@@ -341,6 +433,7 @@ export function createMiniCanvasMcpServer(
         }),
       },
       annotations: localWriteAnnotations,
+      _meta: noAuthToolMeta,
     },
     async (input) =>
       toolResult(
@@ -366,6 +459,7 @@ export function createMiniCanvasMcpServer(
       inputSchema: { query: z.string() },
       outputSchema: searchOutputSchema,
       annotations: readOnlyAnnotations,
+      _meta: noAuthToolMeta,
     },
     async ({ query }) =>
       toolResult(
@@ -395,6 +489,7 @@ export function createMiniCanvasMcpServer(
       inputSchema: { id: z.string() },
       outputSchema: fetchOutputSchema,
       annotations: readOnlyAnnotations,
+      _meta: noAuthToolMeta,
     },
     async ({ id }) =>
       toolResult(
@@ -424,6 +519,7 @@ export function createMiniCanvasMcpServer(
       inputSchema: {},
       outputSchema: { ok: z.literal(true) },
       annotations: localWriteAnnotations,
+      _meta: noAuthToolMeta,
     },
     async () =>
       toolResult(
