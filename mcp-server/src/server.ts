@@ -6,6 +6,8 @@ import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 import { principalFromAuth } from "./auth.ts";
+import { AuthenticationThrottle } from "../../livesync-bridge/src/auth-security.ts";
+import { API_SECURITY_HEADERS } from "../../livesync-bridge/src/http-security.ts";
 import type { McpConfig } from "./config.ts";
 import { createMiniCanvasMcpServer } from "./mcp.ts";
 import type { McpRuntime } from "./runtime.ts";
@@ -17,6 +19,14 @@ export async function startMcpHttpServer(
   const app = createMcpExpressApp({
     host: config.host,
     allowedHosts: config.allowedHosts,
+  });
+  const authThrottle = new AuthenticationThrottle();
+
+  app.use((_request: Request, response: Response, next) => {
+    for (const [name, value] of Object.entries(API_SECURITY_HEADERS)) {
+      response.setHeader(name, value);
+    }
+    next();
   });
 
   app.get("/health", async (_request: Request, response: Response) => {
@@ -46,6 +56,21 @@ export async function startMcpHttpServer(
     "/.well-known/oauth-protected-resource",
     oauthMetadataNotAvailable,
   );
+
+  app.use("/mcp", (request: Request, response: Response, next) => {
+    const clientKey = request.socket.remoteAddress ?? "unknown";
+    const retryAfter = authThrottle.retryAfterSeconds(clientKey);
+    if (retryAfter > 0) {
+      response.setHeader("Retry-After", String(retryAfter));
+      response.status(429).json({ error: "too_many_authentication_failures" });
+      return;
+    }
+    response.on("finish", () => {
+      if (response.statusCode === 401) authThrottle.recordFailure(clientKey);
+      else if (response.statusCode < 400) authThrottle.recordSuccess(clientKey);
+    });
+    next();
+  });
 
   app.use(
     "/mcp",

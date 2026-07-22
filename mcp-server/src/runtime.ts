@@ -9,6 +9,7 @@ import { MiniCanvasService } from "./service.ts";
 
 export type McpRuntime = {
   database: McpDatabase;
+  drafts: DraftRepository;
   gateway: BridgeHttpClient;
   search: SearchCoordinator;
   service: MiniCanvasService;
@@ -23,14 +24,16 @@ export function createMcpRuntime(config: McpConfig): McpRuntime {
     token: config.bridgeToken,
   });
   const search = new SearchCoordinator(new SearchIndex(database, crypto), gateway);
+  const drafts = new DraftRepository(database, crypto);
   const service = new MiniCanvasService({
     gateway,
-    drafts: new DraftRepository(database, crypto),
+    drafts,
     search,
     authorizer: new Authorizer(config.caseInsensitivePaths),
   });
   return {
     database,
+    drafts,
     gateway,
     search,
     service,

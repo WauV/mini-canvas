@@ -325,6 +325,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stop-test-couchdb.
 
 Bridge、MCP Server 和 CouchDB 已经可以作为一套隔离容器运行。容器模式继续复用 `mini-canvas-couchdb-test-data`，不会读取或挂载原始 Vault；MCP 的加密草稿和搜索索引保存在独立的 `mini-canvas-mcp-server-data` 数据卷中。切换前如果本机 SQLite 中还有未提交草稿，应先完成或记录，因为容器不会复制 `.local/mcp-server.sqlite`。
 
+安全边界方面，CouchDB 与 MCP 端口只绑定宿主机 `127.0.0.1`，Bridge 不发布宿主机端口；Bridge 和 MCP API 返回禁止缓存、禁止 MIME 猜测与禁止嵌入的响应头。独立网页通过每次请求生成的 nonce 执行 CSP，ChatGPT Widget 则继续使用 MCP Apps 资源元数据中的宿主 CSP，两者互不替代。
+
+MCP Bearer Token 至少为 32 个字符，并通过固定长度摘要进行恒时比较；连续认证失败会受到短时限制。`MINI_CANVAS_MCP_AUTH_JSON` 中的身份记录可增加 `expiresAt`（Unix 秒）以安排轮换。过期草稿默认继续加密保留 30 天，MCP Server 启动时以及每 6 小时自动清理；可通过 `MINI_CANVAS_MCP_DRAFT_RETENTION_DAYS` 调整为 1–365 天。
+
 首次启动前仍需准备三个被 Git 忽略的文件：
 
 - `.local/couchdb.env`

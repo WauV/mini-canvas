@@ -16,6 +16,7 @@ const CONTAINER_KEYS = [
   "MINI_CANVAS_BRIDGE_TOKEN",
   "MINI_CANVAS_MCP_AUTO_INDEX",
   "MINI_CANVAS_VAULT_CASE_INSENSITIVE",
+  "MINI_CANVAS_MCP_DRAFT_RETENTION_DAYS",
 ] as const;
 
 function withContainerEnvironment(callback: () => void): void {
@@ -34,12 +35,14 @@ function withContainerEnvironment(callback: () => void): void {
         userId: "container-user",
         scopes: ["notes:read", "vault:list"],
         allowedPaths: [""],
+        expiresAt: 1_893_456_000,
       },
     ]),
     MINI_CANVAS_BRIDGE_URL: "http://livesync-bridge:3210",
     MINI_CANVAS_BRIDGE_TOKEN: "b".repeat(40),
     MINI_CANVAS_MCP_AUTO_INDEX: "true",
     MINI_CANVAS_VAULT_CASE_INSENSITIVE: "true",
+    MINI_CANVAS_MCP_DRAFT_RETENTION_DAYS: "30",
   });
   try {
     callback();
@@ -61,6 +64,8 @@ test("loads MCP configuration entirely from container environment", () => {
     assert.equal(config.bridgeUrl, "http://livesync-bridge:3210");
     assert.equal(config.databasePath, "/data/mcp-server.sqlite");
     assert.equal(config.tokens[0].userId, "container-user");
+    assert.equal(config.tokens[0].expiresAt, 1_893_456_000);
+    assert.equal(config.draftRetentionDays, 30);
   });
 });
 

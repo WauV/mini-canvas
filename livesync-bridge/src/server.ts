@@ -1,4 +1,3 @@
-import { timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 
@@ -9,6 +8,11 @@ import {
 } from "./bridge.ts";
 import type { BridgeServerConfig } from "./config.ts";
 import { CouchDbHttpError } from "./couchdb.ts";
+import {
+  AuthenticationThrottle,
+  constantTimeTokenEqual,
+} from "./auth-security.ts";
+import { API_SECURITY_HEADERS } from "./http-security.ts";
 import type {
   ListVaultEntriesInput,
   VaultEntryKind,
@@ -23,10 +27,9 @@ function sendJson(
 ): void {
   const body = Buffer.from(JSON.stringify(value), "utf8");
   response.writeHead(status, {
-    "Cache-Control": "no-store",
+    ...API_SECURITY_HEADERS,
     "Content-Length": body.byteLength,
     "Content-Type": "application/json; charset=utf-8",
-    "X-Content-Type-Options": "nosniff",
   });
   response.end(body);
 }
@@ -37,9 +40,8 @@ function sendBytes(
   headers: Record<string, string>,
 ): void {
   response.writeHead(200, {
-    "Cache-Control": "no-store",
+    ...API_SECURITY_HEADERS,
     "Content-Length": String(value.byteLength),
-    "X-Content-Type-Options": "nosniff",
     ...headers,
   });
   response.end(Buffer.from(value));
@@ -47,9 +49,7 @@ function sendBytes(
 
 function tokenMatches(header: string | undefined, expected: string): boolean {
   if (!header?.startsWith("Bearer ")) return false;
-  const provided = Buffer.from(header.slice("Bearer ".length), "utf8");
-  const wanted = Buffer.from(expected, "utf8");
-  return provided.byteLength === wanted.byteLength && timingSafeEqual(provided, wanted);
+  return constantTimeTokenEqual(header.slice("Bearer ".length), expected);
 }
 
 async function readJson(request: IncomingMessage): Promise<Record<string, unknown>> {
@@ -114,20 +114,31 @@ export function createBridgeHttpServer(
   maxAttachmentBytes = 20 * 1024 * 1024,
 ): Server {
   if (!authToken) throw new Error("Bridge HTTP 服务不能使用空认证令牌");
+  const authThrottle = new AuthenticationThrottle();
 
   return createServer(async (request, response) => {
     try {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
+      const clientKey = request.socket.remoteAddress ?? "unknown";
 
       if (request.method === "GET" && url.pathname === "/health") {
         sendJson(response, 200, { ok: true, service: "mini-canvas-livesync-bridge" });
         return;
       }
 
+      const retryAfter = authThrottle.retryAfterSeconds(clientKey);
+      if (retryAfter > 0) {
+        response.setHeader("Retry-After", String(retryAfter));
+        sendJson(response, 429, { error: "too_many_authentication_failures" });
+        return;
+      }
+
       if (!tokenMatches(request.headers.authorization, authToken)) {
+        authThrottle.recordFailure(clientKey);
         sendJson(response, 401, { error: "unauthorized" });
         return;
       }
+      authThrottle.recordSuccess(clientKey);
 
       if (request.method !== "POST") {
         routeNotFound(response);

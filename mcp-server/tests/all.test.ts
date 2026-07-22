@@ -133,6 +133,15 @@ test("static tokens produce a server-side principal and path boundaries are enfo
   );
   assert.throws(() => authorizer.requirePath(principal, "../secret.md"));
   await assert.rejects(() => verifier.verifyAccessToken("b".repeat(32)));
+
+  const expiredVerifier = new StaticTokenVerifier([
+    {
+      ...principal,
+      token: "c".repeat(32),
+      expiresAt: Math.floor(Date.now() / 1_000) - 1,
+    },
+  ]);
+  await assert.rejects(() => expiredVerifier.verifyAccessToken("c".repeat(32)));
 });
 
 test("drafts are encrypted at rest and use optimistic versions", async () => {
@@ -196,6 +205,33 @@ test("expiring a draft returns the same updated timestamp written to SQLite", ()
   assert.equal(expired.status, "expired");
   assert.ok(expired.updatedAt >= before);
   assert.equal(expired.updatedAt, persisted.updated_at);
+  database.close();
+});
+
+test("expired drafts are marked first and deleted after the recovery window", () => {
+  const database = new McpDatabase(":memory:");
+  const repository = new DraftRepository(database, new AtRestCrypto(masterKey));
+  const draft = repository.create({
+    userId: "tester",
+    path: "Notes/Cleanup.md",
+    content: "# Cleanup",
+    baseRevision: "1-cleanup",
+  });
+  const now = 10_000;
+  database.connection
+    .prepare("UPDATE drafts SET expires_at = ?, updated_at = 1 WHERE id = ?")
+    .run(now, draft.id);
+  assert.deepEqual(repository.cleanupExpired(now, 1_000), {
+    markedExpired: 1,
+    deleted: 0,
+  });
+  assert.equal(repository.get(draft.id, "tester").status, "expired");
+
+  assert.deepEqual(repository.cleanupExpired(now + 1_001, 1_000), {
+    markedExpired: 0,
+    deleted: 1,
+  });
+  assert.throws(() => repository.get(draft.id, "tester"));
   database.close();
 });
 

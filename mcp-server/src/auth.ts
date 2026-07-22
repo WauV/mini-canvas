@@ -1,9 +1,8 @@
-import { timingSafeEqual } from "node:crypto";
-
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import type { OAuthTokenVerifier } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 
 import { normalisePath } from "../../livesync-bridge/src/bridge.ts";
+import { constantTimeTokenEqual } from "../../livesync-bridge/src/auth-security.ts";
 import { MCP_SCOPES, type McpScope, type Principal } from "./types.ts";
 
 export class AuthenticationError extends Error {
@@ -20,12 +19,10 @@ export class AuthorizationError extends Error {
   }
 }
 
-export type StaticTokenRecord = Principal & { token: string };
+export type StaticTokenRecord = Principal & { token: string; expiresAt?: number };
 
 function tokenEquals(provided: string, expected: string): boolean {
-  const left = Buffer.from(provided, "utf8");
-  const right = Buffer.from(expected, "utf8");
-  return left.byteLength === right.byteLength && timingSafeEqual(left, right);
+  return constantTimeTokenEqual(provided, expected);
 }
 
 function normalizeAllowedPath(path: string): string {
@@ -53,16 +50,32 @@ export class StaticTokenVerifier implements OAuthTokenVerifier {
     this.records = records.map((record) => ({
       ...validatePrincipal(record),
       token: record.token,
+      ...(record.expiresAt === undefined ? {} : { expiresAt: record.expiresAt }),
     }));
     if (this.records.some((record) => record.token.length < 32)) {
       throw new Error("MCP Bearer Token 至少需要 32 个字符");
+    }
+    if (
+      this.records.some(
+        (record) =>
+          record.expiresAt !== undefined &&
+          (!Number.isInteger(record.expiresAt) || record.expiresAt <= 0),
+      )
+    ) {
+      throw new Error("MCP Bearer Token expiresAt 必须是正整数 Unix 秒时间戳");
     }
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     let record: StaticTokenRecord | undefined;
+    const now = Math.floor(Date.now() / 1_000);
     for (const candidate of this.records) {
-      if (tokenEquals(token, candidate.token)) record = candidate;
+      if (
+        tokenEquals(token, candidate.token) &&
+        (candidate.expiresAt === undefined || candidate.expiresAt > now)
+      ) {
+        record = candidate;
+      }
     }
     if (!record) throw new AuthenticationError();
     const principal: Principal = {
@@ -74,7 +87,7 @@ export class StaticTokenVerifier implements OAuthTokenVerifier {
       token,
       clientId: record.userId,
       scopes: record.scopes,
-      expiresAt: 253_402_300_799,
+      expiresAt: record.expiresAt ?? 253_402_300_799,
       extra: { principal },
     };
   }

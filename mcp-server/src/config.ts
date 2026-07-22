@@ -16,6 +16,7 @@ export type McpConfig = {
   bridgeToken: string;
   autoIndex: boolean;
   caseInsensitivePaths: boolean;
+  draftRetentionDays: number;
 };
 
 function parseEnvFile(path: string, optional = false): Record<string, string> {
@@ -145,12 +146,22 @@ function parseTokens(raw: string): StaticTokenRecord[] {
     ) {
       throw new Error(`MCP 身份记录 ${index} 字段无效`);
     }
+    if (
+      record.expiresAt !== undefined &&
+      (!Number.isInteger(record.expiresAt) || record.expiresAt <= 0)
+    ) {
+      throw new Error(`MCP 身份记录 ${index} 的 expiresAt 必须是正整数 Unix 秒时间戳`);
+    }
     const principal: Principal = {
       userId: record.userId,
       scopes: record.scopes as McpScope[],
       allowedPaths: record.allowedPaths,
     };
-    return { token: record.token, ...principal };
+    return {
+      token: record.token,
+      ...principal,
+      ...(record.expiresAt === undefined ? {} : { expiresAt: record.expiresAt }),
+    };
   });
 }
 
@@ -182,6 +193,16 @@ export function loadMcpConfig(projectRoot = projectRootFromMcpModule()): McpConf
     requireValue(values, "MINI_CANVAS_BRIDGE_URL"),
   );
   const host = parseListenHost(values.MINI_CANVAS_MCP_HOST);
+  const draftRetentionDays = Number(
+    values.MINI_CANVAS_MCP_DRAFT_RETENTION_DAYS ?? "30",
+  );
+  if (
+    !Number.isInteger(draftRetentionDays) ||
+    draftRetentionDays < 1 ||
+    draftRetentionDays > 365
+  ) {
+    throw new Error("MINI_CANVAS_MCP_DRAFT_RETENTION_DAYS 必须是 1 到 365 之间的整数");
+  }
   return {
     host,
     port,
@@ -197,5 +218,6 @@ export function loadMcpConfig(projectRoot = projectRootFromMcpModule()): McpConf
     autoIndex: (values.MINI_CANVAS_MCP_AUTO_INDEX ?? "true").toLowerCase() === "true",
     caseInsensitivePaths:
       (values.MINI_CANVAS_VAULT_CASE_INSENSITIVE ?? "true").toLowerCase() === "true",
+    draftRetentionDays,
   };
 }

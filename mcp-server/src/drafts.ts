@@ -75,6 +75,13 @@ function changes(result: StatementResultingChanges): number {
   return Number(result.changes);
 }
 
+export const DEFAULT_EXPIRED_DRAFT_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+
+export type DraftCleanupResult = {
+  markedExpired: number;
+  deleted: number;
+};
+
 export class DraftRepository {
   private readonly db: McpDatabase;
   private readonly crypto: AtRestCrypto;
@@ -133,6 +140,31 @@ export class DraftRepository {
         ? { committedRevision: row.committed_revision }
         : {}),
     };
+  }
+
+  cleanupExpired(
+    now = Date.now(),
+    retentionMs = DEFAULT_EXPIRED_DRAFT_RETENTION_MS,
+  ): DraftCleanupResult {
+    if (!Number.isFinite(now) || !Number.isFinite(retentionMs) || retentionMs < 0) {
+      throw new Error("草稿清理时间参数无效");
+    }
+    return this.db.transaction(() => {
+      const markedExpired = changes(
+        this.db.connection.prepare(`
+          UPDATE drafts
+          SET status = 'expired', updated_at = ?
+          WHERE status = 'active' AND expires_at <= ?
+        `).run(now, now),
+      );
+      const deleted = changes(
+        this.db.connection.prepare(`
+          DELETE FROM drafts
+          WHERE status = 'expired' AND expires_at <= ?
+        `).run(now - retentionMs),
+      );
+      return { markedExpired, deleted };
+    });
   }
 
   create(input: {

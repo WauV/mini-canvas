@@ -12,6 +12,22 @@ async function main(): Promise<void> {
   const command = process.argv[2] ?? "serve";
   const config = loadMcpConfig();
   const runtime = createMcpRuntime(config);
+  const cleanupDrafts = () => {
+    try {
+      const result = runtime.drafts.cleanupExpired(
+        Date.now(),
+        config.draftRetentionDays * 24 * 60 * 60 * 1_000,
+      );
+      if (result.markedExpired > 0 || result.deleted > 0) {
+        console.log(
+          `Mini Canvas drafts cleaned: expired=${result.markedExpired}, deleted=${result.deleted}`,
+        );
+      }
+    } catch (error) {
+      console.error("Mini Canvas draft cleanup failed", error);
+    }
+  };
+  cleanupDrafts();
 
   if (command === "index") {
     await runtime.search.refresh(process.argv.includes("--rebuild"));
@@ -27,11 +43,14 @@ async function main(): Promise<void> {
   await runtime.search.start(config.autoIndex);
   const server = await startMcpHttpServer(config, runtime);
   console.log(`Mini Canvas MCP listening on http://${config.host}:${config.port}/mcp`);
+  const draftCleanupTimer = setInterval(cleanupDrafts, 6 * 60 * 60 * 1_000);
+  draftCleanupTimer.unref();
 
   let closing = false;
   const shutdown = async () => {
     if (closing) return;
     closing = true;
+    clearInterval(draftCleanupTimer);
     await closeServer(server);
     await runtime.search.stop();
     runtime.database.close();
