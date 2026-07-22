@@ -3,6 +3,7 @@
 [简体中文](./README.md) | [English](./README.en.md)
 
 [![CI](https://github.com/WauV/mini-canvas/actions/workflows/ci.yml/badge.svg)](https://github.com/WauV/mini-canvas/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 
 > Mini Canvas is currently a pre-release project designed for an isolated test Vault. Do not connect a production knowledge base before you have a verified backup, a restore drill, and an explicit permission review.
 
@@ -637,4 +638,4 @@ Remove note content, CouchDB credentials, LiveSync passphrases, MCP tokens, Open
 
 ## License
 
-This repository does not yet include a `LICENSE` file. Until the project owner selects and commits an explicit open-source license, copyright law does not automatically grant permission to copy, modify, or redistribute the code. Choose a license such as MIT, Apache-2.0, or another license compatible with the dependencies and release goals before a public open-source release.
+Mini Canvas is licensed under the [Apache License 2.0](./LICENSE), with copyright held by `WauV` and project contributors. You may use, modify, and distribute the project under the terms of that license. Redistributions must retain the applicable license, copyright, and attribution notices. Third-party dependencies remain subject to their respective licenses; see [NOTICE](./NOTICE) for additional attribution information.

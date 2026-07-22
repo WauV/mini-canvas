@@ -3,6 +3,7 @@
 [简体中文](./README.md) | [English](./README.en.md)
 
 [![CI](https://github.com/WauV/mini-canvas/actions/workflows/ci.yml/badge.svg)](https://github.com/WauV/mini-canvas/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 
 > 当前处于面向隔离测试 Vault 的预发布阶段。请勿在没有备份、恢复演练和权限审查的情况下直接连接正式笔记库。
 
@@ -905,4 +906,4 @@ npx @modelcontextprotocol/inspector@latest
 
 ## 开源许可
 
-仓库目前尚未加入 `LICENSE` 文件。在选择并提交明确的开源许可证之前，源码默认不自动授予复制、修改或再分发权。正式公开发布前应由项目所有者选择合适的许可证；常见选择包括 MIT、Apache-2.0 或其他与依赖和发布目标相符的许可证。
+Mini Canvas 采用 [Apache License 2.0](./LICENSE) 开源，版权归 `WauV` 及项目贡献者所有。你可以在协议允许的范围内使用、修改和分发本项目；再分发时须保留许可证、版权与归属声明。第三方依赖继续遵循各自的许可证，补充归属信息见 [NOTICE](./NOTICE)。
