@@ -31,6 +31,8 @@
     "container:down": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-container-stack.ps1",
     "container:verify": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-container-stack.ps1",
     "container:logs": "docker compose --env-file .local/couchdb.env -f docker-compose.yml logs --follow --tail=100",
+    "hosts:configure": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/configure-mcp-clients.ps1",
+    "hosts:remove": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/remove-mcp-clients.ps1",
     "tunnel:save-key": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/save-tunnel-api-key.ps1",
     "tunnel:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-secure-tunnel.ps1"
   },
@@ -44,6 +46,7 @@
     "@modelcontextprotocol/ext-apps": "^1.7.4",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "drizzle-orm": "0.45.2",
+    "express": "^5.2.1",
     "katex": "^0.17.0",
     "next": "16.2.6",
     "react": "19.2.6",

@@ -5,6 +5,7 @@ import type { BridgeConfig } from "./config.ts";
 import { CouchDbClient, CouchDbHttpError } from "./couchdb.ts";
 import { decodePbkdf2Salt, LiveSyncV2Crypto } from "./crypto.ts";
 import { liveSyncChunkId } from "./hash.ts";
+import { NEW_NOTE_EXPECTED_REVISION } from "./types.ts";
 import type {
   CommitNoteInput,
   CommitNoteResult,
@@ -621,6 +622,66 @@ export class LiveSyncBridge {
     }
 
     const documentId = this.pathToDocumentId(path);
+    if (input.expectedRevision === NEW_NOTE_EXPECTED_REVISION) {
+      const existing =
+        await this.couch.getDocumentOrNull<LiveSyncMetadataDocument>(documentId);
+      if (existing) {
+        const current = await this.readNote(path);
+        if (current.content === input.content) {
+          await this.saveCommitRecord(recordId, payloadDigest, current);
+          return { ...current, idempotentReplay: true };
+        }
+        throw new RevisionConflictError(
+          NEW_NOTE_EXPECTED_REVISION,
+          current.revision,
+        );
+      }
+
+      const pieces = splitByUtf8Bytes(input.content, WRITE_CHUNK_UTF8_BYTES);
+      const children: string[] = [];
+      for (const piece of pieces) children.push(await this.ensureChunk(piece));
+
+      const now = Date.now();
+      const created = {
+        _id: documentId,
+        children,
+        path,
+        ctime: now,
+        mtime: now,
+        size: Buffer.byteLength(input.content, "utf8"),
+        type: "plain",
+        eden: {},
+      };
+      let response: { ok: true; id: string; rev: string };
+      try {
+        response = await this.couch.putDocument(created);
+      } catch (error) {
+        if (!(error instanceof CouchDbHttpError && error.status === 409)) {
+          throw error;
+        }
+        const current = await this.readNote(path);
+        if (current.content === input.content) {
+          await this.saveCommitRecord(recordId, payloadDigest, current);
+          return { ...current, idempotentReplay: true };
+        }
+        throw new RevisionConflictError(
+          NEW_NOTE_EXPECTED_REVISION,
+          current.revision,
+        );
+      }
+      const result: NoteSnapshot = {
+        path,
+        content: input.content,
+        revision: response.rev,
+        ctime: now,
+        mtime: now,
+        size: created.size,
+        children,
+      };
+      await this.saveCommitRecord(recordId, payloadDigest, result);
+      return { ...result, idempotentReplay: false };
+    }
+
     const metadata =
       await this.couch.getDocument<LiveSyncMetadataDocument>(documentId);
 

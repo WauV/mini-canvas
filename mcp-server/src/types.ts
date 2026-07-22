@@ -24,6 +24,7 @@ export type DraftSnapshot = {
   path: string;
   content: string;
   baseRevision: string;
+  isNew: boolean;
   version: number;
   status: DraftStatus;
   createdAt: number;
@@ -31,6 +32,8 @@ export type DraftSnapshot = {
   expiresAt: number;
   committedRevision?: string;
 };
+
+export type DraftSummary = Omit<DraftSnapshot, "userId" | "content">;
 
 export type DraftWithBase = DraftSnapshot & {
   baseContent: string;
@@ -40,7 +43,9 @@ export type CommitPreview = {
   draftId: string;
   path: string;
   version: number;
+  confirmationToken: string;
   baseRevision: string;
+  isNew: boolean;
   changed: boolean;
   characterDelta: number;
   lineDelta: number;

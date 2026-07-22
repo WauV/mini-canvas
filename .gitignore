@@ -13,6 +13,10 @@
 # testing
 /coverage
 /.local/
+/.gemini/
+/deploy/production/.env
+/deploy/production/secrets/
+/backups/
 
 # next.js
 /.next/

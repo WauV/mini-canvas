@@ -125,8 +125,12 @@ export function loadBridgeConfig(projectRoot = projectRootFromModule()): BridgeC
   return {
     couchDbUrl,
     database: requireValue(couch, "COUCHDB_DATABASE"),
-    username: requireValue(couch, "COUCHDB_USER"),
-    password: requireValue(couch, "COUCHDB_PASSWORD"),
+    // Production uses a non-admin CouchDB application account. Local test
+    // environments keep the existing admin-variable fallback.
+    username:
+      couch.COUCHDB_APP_USER ?? requireValue(couch, "COUCHDB_USER"),
+    password:
+      couch.COUCHDB_APP_PASSWORD ?? requireValue(couch, "COUCHDB_PASSWORD"),
     passphrase: requireValue(liveSync, "LIVESYNC_PASSPHRASE"),
     caseInsensitive:
       (liveSync.LIVESYNC_CASE_INSENSITIVE ?? "false").toLowerCase() === "true",

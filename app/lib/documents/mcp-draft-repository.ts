@@ -132,11 +132,13 @@ export class McpDraftDocumentRepository implements DocumentRepository {
   async commit(
     expectedVersion: string,
     idempotencyKey: string,
+    confirmationToken: string,
   ): Promise<CommitDraftResult> {
     const result = await this.client.commitDraft({
       draftId: this.currentDraft.id,
       expectedVersion: numericVersion(expectedVersion),
       idempotencyKey,
+      confirmationToken,
     });
     this.accept(result.draft);
     return result;

@@ -3,6 +3,20 @@ import { test } from "vitest";
 
 import { parseWidgetLaunch } from "../app/lib/mcp/use-widget-host.ts";
 
+const draft = {
+  id: "draft-1",
+  userId: "tester",
+  path: "Notes/Test.md",
+  content: "# MCP",
+  baseRevision: "1-base",
+  isNew: false,
+  version: 1,
+  status: "active" as const,
+  createdAt: 1,
+  updatedAt: 2,
+  expiresAt: 3,
+};
+
 test("parses picker and draft Widget launch payloads", () => {
   assert.deepEqual(
     parseWidgetLaunch({ structuredContent: { mode: "picker" } }),
@@ -13,6 +27,13 @@ test("parses picker and draft Widget launch payloads", () => {
       structuredContent: { mode: "draft", draftId: "draft-1" },
     }),
     { mode: "draft", draftId: "draft-1" },
+  );
+  assert.deepEqual(
+    parseWidgetLaunch({
+      structuredContent: { mode: "draft", draftId: "draft-1" },
+      _meta: { draft },
+    }),
+    { mode: "draft", draftId: "draft-1", draft },
   );
 });
 

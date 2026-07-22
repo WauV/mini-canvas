@@ -75,6 +75,7 @@ function activeDraft(content = "# MCP 原文", version = 1): DraftSnapshot {
     path: "Notes/Test.md",
     content,
     baseRevision: "1-base",
+    isNew: false,
     version,
     status: "active",
     createdAt: 1,
@@ -86,6 +87,8 @@ function activeDraft(content = "# MCP 原文", version = 1): DraftSnapshot {
 class FakeMcpTools implements McpToolClient {
   currentDraft = activeDraft();
   conflictNextUpdate = false;
+  failNextUpdate = false;
+  previewGate: Promise<void> | null = null;
   requestedDisplayModes: McpDisplayMode[] = [];
   readonly calls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
   private readonly listeners = new Set<McpToolResultListener>();
@@ -118,6 +121,13 @@ class FakeMcpTools implements McpToolClient {
     }
     if (name === "update_draft") {
       const expectedVersion = Number(arguments_.expectedVersion);
+      if (this.failNextUpdate) {
+        this.failNextUpdate = false;
+        return {
+          isError: true,
+          content: [{ type: "text", text: "MCP 草稿保存暂时失败" }],
+        };
+      }
       if (this.conflictNextUpdate) {
         this.conflictNextUpdate = false;
         this.currentDraft = activeDraft("# Obsidian 新版本", expectedVersion + 1);
@@ -142,12 +152,15 @@ class FakeMcpTools implements McpToolClient {
       return { structuredContent: this.currentDraft };
     }
     if (name === "preview_commit") {
+      await this.previewGate;
       return {
         structuredContent: {
           draftId: this.currentDraft.id,
           path: this.currentDraft.path,
           version: this.currentDraft.version,
+          confirmationToken: "p".repeat(43),
           baseRevision: this.currentDraft.baseRevision,
+          isNew: this.currentDraft.isNew,
           changed: true,
           characterDelta: 6,
           lineDelta: 1,
@@ -418,6 +431,63 @@ describe("MiniCanvas 关键交互", () => {
         "commit_draft",
       ]),
     );
+  });
+
+  test("MCP 保存失败时保留当前编辑并阻止切换笔记", async () => {
+    const tools = await renderLoadedPage();
+    fireEvent.click(screen.getByRole("button", { name: "打开笔记" }));
+    fireEvent.click(await screen.findByRole("button", { name: /Test/ }));
+    await screen.findByDisplayValue("Test");
+
+    tools.failNextUpdate = true;
+    fireEvent.change(screen.getByLabelText("Markdown 内容"), {
+      target: { value: "# 尚未安全保存" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "打开笔记" }));
+    fireEvent.click(await screen.findByRole("button", { name: /Test/ }));
+
+    expect(
+      await screen.findByText(/当前草稿保存失败，未切换笔记/u),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Markdown 内容")).toHaveValue("# 尚未安全保存");
+    expect(tools.calls.filter((call) => call.name === "create_draft")).toHaveLength(1);
+  });
+
+  test("生成提交预览期间锁定编辑器并提交对应确认令牌", async () => {
+    const tools = await renderLoadedPage();
+    fireEvent.click(screen.getByRole("button", { name: "打开笔记" }));
+    fireEvent.click(await screen.findByRole("button", { name: /Test/ }));
+    await screen.findByDisplayValue("Test");
+
+    fireEvent.change(screen.getByLabelText("Markdown 内容"), {
+      target: { value: "# 准备预览的版本" },
+    });
+    await waitFor(
+      () => expect(tools.currentDraft.content).toBe("# 准备预览的版本"),
+      { timeout: 1_500 },
+    );
+
+    let releasePreview = () => undefined;
+    tools.previewGate = new Promise<void>((resolve) => {
+      releasePreview = resolve;
+    });
+    fireEvent.click(screen.getByRole("button", { name: "预览提交" }));
+    await waitFor(() =>
+      expect(screen.getByLabelText("Markdown 内容")).toHaveAttribute("readonly"),
+    );
+    fireEvent.change(screen.getByLabelText("Markdown 内容"), {
+      target: { value: "# 不应进入预览的版本" },
+    });
+    expect(screen.getByLabelText("Markdown 内容")).toHaveValue("# 准备预览的版本");
+
+    await act(async () => releasePreview());
+    expect(
+      await screen.findByRole("dialog", { name: "写回 Obsidian" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "正式提交" }));
+    await screen.findByText(/已提交到 Obsidian · revision/u);
+    const commit = tools.calls.find((call) => call.name === "commit_draft");
+    expect(commit?.arguments.confirmationToken).toBe("p".repeat(43));
   });
 
   test("草稿乐观锁冲突会停止自动覆盖并给出恢复动作", async () => {

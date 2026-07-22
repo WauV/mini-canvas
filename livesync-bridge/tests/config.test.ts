@@ -10,6 +10,8 @@ const CONTAINER_KEYS = [
   "COUCHDB_DATABASE",
   "COUCHDB_USER",
   "COUCHDB_PASSWORD",
+  "COUCHDB_APP_USER",
+  "COUCHDB_APP_PASSWORD",
   "LIVESYNC_PASSPHRASE",
   "LIVESYNC_CASE_INSENSITIVE",
   "LIVESYNC_BRIDGE_HOST",
@@ -53,6 +55,18 @@ test("loads Bridge configuration entirely from container environment", () => {
     assert.equal(config.couchDbUrl, "http://couchdb-test:5984");
     assert.equal(config.database, "mini_canvas_test");
     assert.equal(config.caseInsensitive, true);
+  });
+});
+
+test("prefers a non-admin CouchDB application account when provided", () => {
+  withContainerEnvironment(() => {
+    process.env.COUCHDB_APP_USER = "mini-canvas-sync";
+    process.env.COUCHDB_APP_PASSWORD = "application-password";
+    const config = loadBridgeServerConfig(
+      join(tmpdir(), "mini-canvas-config-with-application-user"),
+    );
+    assert.equal(config.username, "mini-canvas-sync");
+    assert.equal(config.password, "application-password");
   });
 });
 

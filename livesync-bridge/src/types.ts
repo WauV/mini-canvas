@@ -94,6 +94,10 @@ export type AttachmentSnapshot = {
   size: number;
 };
 
+// A logical revision used only for optimistic creation. It means the target
+// path must not exist at commit time; the Bridge never writes it to CouchDB.
+export const NEW_NOTE_EXPECTED_REVISION = "mini-canvas:new-note:v1";
+
 export type CommitNoteInput = {
   path: string;
   content: string;

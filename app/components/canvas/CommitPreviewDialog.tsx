@@ -49,8 +49,8 @@ export function CommitPreviewDialog({
             <dd>{preview.lineDelta >= 0 ? "+" : ""}{preview.lineDelta}</dd>
           </div>
           <div>
-            <dt>基线 revision</dt>
-            <dd>{preview.baseRevision}</dd>
+            <dt>{preview.isNew ? "提交类型" : "基线 revision"}</dt>
+            <dd>{preview.isNew ? "创建新笔记" : preview.baseRevision}</dd>
           </div>
         </dl>
         <p className="commit-hash">
@@ -66,7 +66,11 @@ export function CommitPreviewDialog({
             onClick={onCommit}
             disabled={!preview.changed || busy}
           >
-            {preview.changed ? "正式提交" : "没有变化"}
+            {preview.changed
+              ? preview.isNew
+                ? "创建笔记"
+                : "正式提交"
+              : "没有变化"}
           </button>
         </div>
       </section>

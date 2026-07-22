@@ -1,8 +1,8 @@
 import type { Server } from "node:http";
-import type { Request, Response } from "express";
+import express, { type NextFunction, type Request, type Response } from "express";
 
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
-import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
+import { hostHeaderValidation } from "@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 import { principalFromAuth } from "./auth.ts";
@@ -12,14 +12,18 @@ import type { McpConfig } from "./config.ts";
 import { createMiniCanvasMcpServer } from "./mcp.ts";
 import type { McpRuntime } from "./runtime.ts";
 
+const MAX_MCP_JSON_BYTES = 2 * 1024 * 1024;
+
 export async function startMcpHttpServer(
   config: McpConfig,
   runtime: McpRuntime,
 ): Promise<Server> {
-  const app = createMcpExpressApp({
-    host: config.host,
-    allowedHosts: config.allowedHosts,
-  });
+  // The SDK helper installs Express' default ~100 KB JSON parser. Markdown
+  // tool calls legitimately carry larger complete-document payloads, so build
+  // the same protected app explicitly with the Bridge-aligned 2 MiB limit.
+  const app = express();
+  app.use(express.json({ limit: MAX_MCP_JSON_BYTES, strict: true }));
+  app.use(hostHeaderValidation(config.allowedHosts));
   const authThrottle = new AuthenticationThrottle();
 
   app.use((_request: Request, response: Response, next) => {
@@ -44,9 +48,11 @@ export async function startMcpHttpServer(
 
   // This deployment intentionally exposes no OAuth challenge to ChatGPT. The
   // Tunnel injects the private Bearer token only on the local MCP hop. Return a
-  // clean 404 so discovery clients do not try to parse Express' HTML fallback.
+  // JSON 404 instead of an empty response: tunnel-client v0.0.10 treats an
+  // empty 404 body as a failed discovery response, while a normal 404 means
+  // that this is intentionally a non-OAuth MCP server.
   const oauthMetadataNotAvailable = (_request: Request, response: Response) => {
-    response.status(404).end();
+    response.status(404).json({ error: "oauth_metadata_not_available" });
   };
   app.get(
     "/.well-known/oauth-protected-resource/mcp",
@@ -115,6 +121,29 @@ export async function startMcpHttpServer(
   };
   app.get("/mcp", methodNotAllowed);
   app.delete("/mcp", methodNotAllowed);
+
+  app.use(
+    (
+      error: unknown,
+      _request: Request,
+      response: Response,
+      next: NextFunction,
+    ) => {
+      if (
+        error instanceof Error &&
+        "type" in error &&
+        error.type === "entity.too.large"
+      ) {
+        response.status(413).json({
+          jsonrpc: "2.0",
+          error: { code: -32001, message: "MCP request body exceeds 2 MiB" },
+          id: null,
+        });
+        return;
+      }
+      next(error);
+    },
+  );
 
   return new Promise<Server>((resolve, reject) => {
     const server = app.listen(config.port, config.host, () => {

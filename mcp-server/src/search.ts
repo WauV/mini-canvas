@@ -334,10 +334,10 @@ export class SearchCoordinator {
             this.index.removePath(event.path);
             continue;
           }
-          // A single corrupt or inaccessible note should not block the entire
-          // batch. Log the error, skip the event, and let the next poll cycle
-          // retry it if the note becomes available again.
-          console.error(`Search index skipped ${event.path}:`, error);
+          // Do not advance the opaque checkpoint past an event that was not
+          // indexed. Earlier events in this batch are safe to replay because
+          // upserts and deletes are idempotent.
+          throw error;
         }
       }
       this.index.setSequence(batch.nextSequence);

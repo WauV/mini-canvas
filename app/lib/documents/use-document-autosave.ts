@@ -8,13 +8,14 @@ import type {
 import type {
   DocumentPersistenceRuntime,
   EnqueueSaveOptions,
+  SaveOutcome,
 } from "./document-persistence-runtime";
 import type { DocumentRepository } from "./types";
 
 export type EnqueueSave = (
   repository: DocumentRepository,
   options?: EnqueueSaveOptions,
-) => Promise<void>;
+) => Promise<SaveOutcome>;
 
 export function useDocumentAutosave(options: {
   state: DocumentPersistenceState;

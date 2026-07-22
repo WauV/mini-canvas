@@ -390,8 +390,25 @@ button {
 }
 
 .canvas-shell.is-widget {
-  min-height: 100dvh;
+  /*
+   * MCP Apps auto-resize measures the document and asks the host to resize the
+   * iframe. A viewport-relative minimum here creates a positive feedback loop:
+   * a taller iframe makes 100dvh taller, which requests an even taller iframe.
+   * Keep the inline Widget finite and let the editor scroll internally.
+   */
+  min-height: 0;
+  height: auto;
   padding: 10px;
+}
+
+.widget-bootstrap {
+  min-height: 220px;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  color: #6f655d;
+  background: #f7f3ec;
+  font: 500 14px/1.5 system-ui, sans-serif;
 }
 
 .is-widget .canvas-header,
@@ -401,8 +418,8 @@ button {
 }
 
 .is-widget .workspace {
-  height: calc(100dvh - 123px);
-  min-height: 420px;
+  height: 560px;
+  min-height: 0;
   border-radius: 14px;
   box-shadow: 0 14px 42px rgba(76, 61, 49, 0.11);
 }
@@ -1487,7 +1504,7 @@ button {
   }
 
   .is-widget .workspace {
-    height: calc(100dvh - 93px);
+    height: 500px;
   }
 
   .editor-toolbar {

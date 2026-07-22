@@ -47,6 +47,7 @@ export type DraftSnapshot = {
   path: string;
   content: string;
   baseRevision: string;
+  isNew: boolean;
   version: number;
   status: DraftStatus;
   createdAt: number;
@@ -59,7 +60,9 @@ export type CommitPreview = {
   draftId: string;
   path: string;
   version: number;
+  confirmationToken: string;
   baseRevision: string;
+  isNew: boolean;
   changed: boolean;
   characterDelta: number;
   lineDelta: number;
@@ -167,7 +170,7 @@ function isBase64(value: string): boolean {
   );
 }
 
-function parseDraft(value: unknown): DraftSnapshot {
+export function parseDraftSnapshot(value: unknown): DraftSnapshot {
   const item = record(value, "草稿工具");
   const status = stringField(item, "status");
   if (status !== "active" && status !== "committed" && status !== "expired") {
@@ -180,6 +183,7 @@ function parseDraft(value: unknown): DraftSnapshot {
     path: stringField(item, "path"),
     content: stringField(item, "content"),
     baseRevision: stringField(item, "baseRevision"),
+    isNew: booleanField(item, "isNew"),
     version: numberField(item, "version"),
     status,
     createdAt: numberField(item, "createdAt"),
@@ -195,7 +199,9 @@ function parsePreview(value: unknown): CommitPreview {
     draftId: stringField(item, "draftId"),
     path: stringField(item, "path"),
     version: numberField(item, "version"),
+    confirmationToken: stringField(item, "confirmationToken"),
     baseRevision: stringField(item, "baseRevision"),
+    isNew: booleanField(item, "isNew"),
     changed: booleanField(item, "changed"),
     characterDelta: numberField(item, "characterDelta"),
     lineDelta: numberField(item, "lineDelta"),
@@ -330,12 +336,17 @@ export class MiniCanvasMcpClient {
     return { ...common, delivery, data: image.data };
   }
 
-  async createDraft(path: string): Promise<DraftSnapshot> {
-    return parseDraft(await this.structured("create_draft", { path }));
+  async createDraft(
+    path: string,
+    options: { createIfMissing?: boolean; content?: string } = {},
+  ): Promise<DraftSnapshot> {
+    return parseDraftSnapshot(
+      await this.structured("create_draft", { path, ...options }),
+    );
   }
 
   async getDraft(draftId: string): Promise<DraftSnapshot> {
-    return parseDraft(await this.structured("get_draft", { draftId }));
+    return parseDraftSnapshot(await this.structured("get_draft", { draftId }));
   }
 
   async updateDraft(input: {
@@ -343,7 +354,7 @@ export class MiniCanvasMcpClient {
     content: string;
     expectedVersion: number;
   }): Promise<DraftSnapshot> {
-    return parseDraft(await this.structured("update_draft", input));
+    return parseDraftSnapshot(await this.structured("update_draft", input));
   }
 
   async previewCommit(draftId: string, expectedVersion: number): Promise<CommitPreview> {
@@ -356,11 +367,12 @@ export class MiniCanvasMcpClient {
     draftId: string;
     expectedVersion: number;
     idempotencyKey: string;
+    confirmationToken: string;
   }): Promise<CommitDraftResult> {
     const value = record(await this.structured("commit_draft", input), "提交结果");
     const note = record(value.note, "提交笔记");
     return {
-      draft: parseDraft(value.draft),
+      draft: parseDraftSnapshot(value.draft),
       note: {
         path: stringField(note, "path"),
         content: stringField(note, "content"),

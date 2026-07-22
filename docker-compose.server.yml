@@ -1,0 +1,203 @@
+name: mini-canvas
+
+services:
+  couchdb:
+    image: ${COUCHDB_IMAGE:-couchdb:3}
+    restart: unless-stopped
+    env_file:
+      - ./deploy/production/secrets/couchdb-admin.env
+    volumes:
+      - couchdb-data:/opt/couchdb/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl --fail --silent --show-error
+          --user "$${COUCHDB_USER}:$${COUCHDB_PASSWORD}"
+          http://127.0.0.1:5984/_up > /dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - couchdb-edge
+      - couchdb-bridge
+
+  couchdb-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: livesync-bridge
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-public.ecr.aws/docker/library/node:22-bookworm-slim}
+    image: mini-canvas-livesync-bridge:${MINI_CANVAS_IMAGE_TAG:-server}
+    restart: "no"
+    command:
+      - node
+      - --experimental-strip-types
+      - scripts/init-couchdb-container.ts
+    env_file:
+      - ./deploy/production/secrets/couchdb-admin.env
+      - ./deploy/production/secrets/couchdb-app.env
+    environment:
+      COUCHDB_URL: http://couchdb:5984
+    depends_on:
+      couchdb:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - couchdb-bridge
+
+  livesync-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: livesync-bridge
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-public.ecr.aws/docker/library/node:22-bookworm-slim}
+    image: mini-canvas-livesync-bridge:${MINI_CANVAS_IMAGE_TAG:-server}
+    restart: unless-stopped
+    env_file:
+      - ./deploy/production/secrets/couchdb-app.env
+      - ./deploy/production/secrets/livesync.env
+      - ./deploy/production/secrets/bridge-token.env
+    environment:
+      COUCHDB_URL: http://couchdb:5984
+      LIVESYNC_BRIDGE_HOST: 0.0.0.0
+      LIVESYNC_BRIDGE_PORT: 3210
+    expose:
+      - "3210"
+    depends_on:
+      couchdb-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:3210/health').then(response =>
+          process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - couchdb-bridge
+      - bridge-mcp
+
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: mcp-server
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-public.ecr.aws/docker/library/node:22-bookworm-slim}
+    image: mini-canvas-mcp-server:${MINI_CANVAS_IMAGE_TAG:-server}
+    restart: unless-stopped
+    env_file:
+      - ./deploy/production/secrets/mcp-server.env
+      - ./deploy/production/secrets/bridge-token.env
+    environment:
+      MINI_CANVAS_MCP_HOST: 0.0.0.0
+      MINI_CANVAS_MCP_ALLOWED_HOSTS: ${MCP_DOMAIN},mcp-server,127.0.0.1,localhost
+      MINI_CANVAS_MCP_PORT: 3220
+      MINI_CANVAS_MCP_DB: /data/mcp-server.sqlite
+      MINI_CANVAS_BRIDGE_URL: http://livesync-bridge:3210
+    expose:
+      - "3220"
+    volumes:
+      - mcp-server-data:/data
+    depends_on:
+      livesync-bridge:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:3220/health').then(response =>
+          process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - bridge-mcp
+      - mcp-edge
+
+  caddy:
+    image: ${CADDY_IMAGE:-public.ecr.aws/docker/library/caddy:2-alpine}
+    restart: unless-stopped
+    environment:
+      MCP_DOMAIN: ${MCP_DOMAIN}
+      COUCHDB_DOMAIN: ${COUCHDB_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      couchdb-init:
+        condition: service_completed_successfully
+      mcp-server:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - couchdb-edge
+      - mcp-edge
+      - public-edge
+
+networks:
+  couchdb-edge:
+    internal: true
+  couchdb-bridge:
+    internal: true
+  bridge-mcp:
+    internal: true
+  mcp-edge:
+    internal: true
+  public-edge:
+
+volumes:
+  couchdb-data:
+  mcp-server-data:
+  caddy-data:
+  caddy-config:

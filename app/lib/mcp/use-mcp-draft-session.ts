@@ -83,7 +83,9 @@ export function useMcpDraftSession({
   const activateDraft = useCallback(
     (
       nextDraft: DraftSnapshot,
-      message = `已打开加密草稿 · ${nextDraft.path}`,
+      message = nextDraft.isNew
+        ? `已打开新笔记草稿 · ${nextDraft.path}`
+        : `已打开加密草稿 · ${nextDraft.path}`,
     ): void => {
       const client = getClient();
       const repository = new McpDraftDocumentRepository({
@@ -151,9 +153,17 @@ export function useMcpDraftSession({
       try {
         const currentRepository = repositoryRef.current;
         if (currentRepository) {
-          await enqueueSave(currentRepository);
-          if (hasConflict()) {
-            throw new Error("请先解决当前草稿的保存冲突");
+          const outcome = await enqueueSave(currentRepository);
+          if (outcome.kind === "error") {
+            throw new Error("当前草稿保存失败，未切换笔记；请检查连接后重试");
+          }
+          if (
+            outcome.kind === "conflict" ||
+            outcome.kind === "blocked" ||
+            (outcome.kind === "saved" && !outcome.settled) ||
+            hasConflict()
+          ) {
+            throw new Error("当前草稿尚未安全保存，请先解决保存状态再切换");
           }
         } else if (hasMeaningfulContent(current)) {
           await localRepository()?.backup(current);
@@ -235,11 +245,28 @@ export function useMcpDraftSession({
     setBusy(true);
     setNotice({ kind: "info", text: "正在保存草稿并生成提交预览…" });
     try {
-      await enqueueSave(repository);
-      if (hasConflict()) {
+      const contentAtStart = currentDocument().content;
+      const outcome = await enqueueSave(repository);
+      if (outcome.kind === "error") {
+        throw new Error("草稿保存失败，未生成提交预览；请检查连接后重试");
+      }
+      if (
+        outcome.kind === "conflict" ||
+        outcome.kind === "blocked" ||
+        (outcome.kind === "saved" && !outcome.settled) ||
+        hasConflict()
+      ) {
         throw new Error("请先解决草稿保存冲突");
       }
-      const preview = await repository.previewCommit(currentDocument().version);
+      const savedVersion = currentDocument().version;
+      const preview = await repository.previewCommit(savedVersion);
+      if (
+        currentDocument().content !== contentAtStart ||
+        currentDocument().version !== savedVersion ||
+        preview.version !== Number(savedVersion)
+      ) {
+        throw new Error("生成预览期间草稿发生变化，请重新预览后再提交");
+      }
       setCommitPreview(preview);
       setNotice({
         kind: preview.changed ? "info" : "success",
@@ -267,6 +294,7 @@ export function useMcpDraftSession({
       const result = await repository.commit(
         currentDocument().version,
         createIdempotencyKey(),
+        commitPreview.confirmationToken,
       );
       acceptVersion(String(result.draft.version), result.draft.updatedAt);
       setDraft(result.draft);
@@ -291,9 +319,21 @@ export function useMcpDraftSession({
   const prepareToLeave = useCallback(async (): Promise<boolean> => {
     const repository = repositoryRef.current;
     if (!repository) return true;
-    await enqueueSave(repository);
-    if (!hasConflict()) return true;
-    setNotice({ kind: "error", text: "请先解决当前草稿的保存冲突再切换" });
+    const outcome = await enqueueSave(repository);
+    if (
+      (outcome.kind === "unchanged" ||
+        (outcome.kind === "saved" && outcome.settled)) &&
+      !hasConflict()
+    ) {
+      return true;
+    }
+    setNotice({
+      kind: "error",
+      text:
+        outcome.kind === "error"
+          ? "当前草稿保存失败，已停止切换；请检查连接后重试"
+          : "请先解决当前草稿的保存状态再切换",
+    });
     return false;
   }, [enqueueSave, hasConflict]);
 

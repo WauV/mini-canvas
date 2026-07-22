@@ -13,6 +13,7 @@ function draft(status: DraftSnapshot["status"]): DraftSnapshot {
     path: "Notes/Test.md",
     content: "正文",
     baseRevision: "1-base",
+    isNew: false,
     version: 2,
     status,
     createdAt: 1,
@@ -89,7 +90,9 @@ describe("Canvas 展示组件", () => {
           draftId: "11111111-1111-4111-8111-111111111111",
           path: "Notes/Test.md",
           version: 2,
+          confirmationToken: "p".repeat(43),
           baseRevision: "1-base",
+          isNew: false,
           changed: false,
           characterDelta: -2,
           lineDelta: 0,
@@ -105,6 +108,32 @@ describe("Canvas 展示组件", () => {
     fireEvent.click(screen.getByRole("button", { name: "返回编辑" }));
     expect(onClose).toHaveBeenCalledOnce();
     expect(onCommit).not.toHaveBeenCalled();
+  });
+
+  test("新笔记提交预览明确显示创建操作", () => {
+    render(
+      <CommitPreviewDialog
+        busy={false}
+        preview={{
+          draftId: "22222222-2222-4222-8222-222222222222",
+          path: "Notes/二项式定理.md",
+          version: 1,
+          confirmationToken: "p".repeat(43),
+          baseRevision: "mini-canvas:new-note:v1",
+          isNew: true,
+          changed: true,
+          characterDelta: 42,
+          lineDelta: 3,
+          contentSha256: "b".repeat(64),
+        }}
+        onClose={() => undefined}
+        onCommit={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText("创建新笔记")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "创建笔记" })).toBeEnabled();
+    expect(screen.queryByText("mini-canvas:new-note:v1")).not.toBeInTheDocument();
   });
 
   test("MCP 通知可以关闭", () => {

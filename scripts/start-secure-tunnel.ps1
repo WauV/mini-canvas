@@ -110,10 +110,10 @@ try {
       [string]$failedChecks[0] -eq "FAILED_CHECKS oauth_metadata"
 
     if (-not $onlyExpectedMissingOAuthMetadata) {
-      throw "Tunnel diagnostics failed."
+      throw "Tunnel diagnostics failed. Fix the failed checks before starting the Tunnel."
     }
 
-    Write-Warning "The local MCP intentionally uses a static Bearer token and does not publish OAuth metadata; continuing in plain HTTP MCP mode."
+    Write-Warning "The local MCP uses a Tunnel-injected Bearer token and intentionally does not publish OAuth metadata; continuing with the secured local hop."
   }
 
   Write-Host "Tunnel diagnostics passed. Keep this window open while using Mini Canvas in ChatGPT."

@@ -2,11 +2,14 @@ import { randomUUID } from "node:crypto";
 
 import type { StatementResultingChanges } from "node:sqlite";
 
+import { NEW_NOTE_EXPECTED_REVISION } from "../../livesync-bridge/src/types.ts";
+
 import { AtRestCrypto, type EncryptedValue } from "./crypto.ts";
 import { McpDatabase } from "./database.ts";
 import type {
   DraftSnapshot,
   DraftStatus,
+  DraftSummary,
   DraftWithBase,
 } from "./types.ts";
 
@@ -131,6 +134,7 @@ export class DraftRepository {
       content,
       baseContent,
       baseRevision: row.base_revision,
+      isNew: row.base_revision === NEW_NOTE_EXPECTED_REVISION,
       version: row.version,
       status: row.status,
       createdAt: row.created_at,
@@ -140,6 +144,69 @@ export class DraftRepository {
         ? { committedRevision: row.committed_revision }
         : {}),
     };
+  }
+
+  private decodeSummary(row: DraftRow): DraftSummary {
+    const path = this.crypto.decryptDraft(
+      encryptedFromRow(row as unknown as Record<string, unknown>, "path"),
+      this.aad(row.user_id, row.id, "path"),
+    );
+    return {
+      id: row.id,
+      path,
+      baseRevision: row.base_revision,
+      isNew: row.base_revision === NEW_NOTE_EXPECTED_REVISION,
+      version: row.version,
+      status: row.status,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      expiresAt: row.expires_at,
+      ...(row.committed_revision
+        ? { committedRevision: row.committed_revision }
+        : {}),
+    };
+  }
+
+  list(
+    userId: string,
+    options: {
+      status?: DraftStatus;
+      path?: string;
+      limit?: number;
+    } = {},
+  ): DraftSummary[] {
+    const limit = options.limit ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error("草稿列表 limit 必须在 1 到 100 之间");
+    }
+
+    const now = Date.now();
+    this.db.connection.prepare(`
+      UPDATE drafts
+      SET status = 'expired', updated_at = ?
+      WHERE user_id = ? AND status = 'active' AND expires_at <= ?
+    `).run(now, userId, now);
+
+    const rows = (options.status
+      ? this.db.connection.prepare(`
+          SELECT * FROM drafts
+          WHERE user_id = ? AND status = ?
+          ORDER BY updated_at DESC, created_at DESC, id DESC
+        `).all(userId, options.status)
+      : this.db.connection.prepare(`
+          SELECT * FROM drafts
+          WHERE user_id = ?
+          ORDER BY updated_at DESC, created_at DESC, id DESC
+        `).all(userId)) as unknown as DraftRow[];
+
+    const summaries: DraftSummary[] = [];
+    for (const row of rows) {
+      const summary = this.decodeSummary(row);
+      if (options.path !== undefined && summary.path !== options.path) continue;
+      summaries.push(summary);
+      if (summaries.length === limit) break;
+    }
+    return summaries;
   }
 
   cleanupExpired(
@@ -171,6 +238,7 @@ export class DraftRepository {
     userId: string;
     path: string;
     content: string;
+    baseContent?: string;
     baseRevision: string;
     expiresInHours?: number;
   }): DraftSnapshot {
@@ -186,7 +254,7 @@ export class DraftRepository {
       this.aad(input.userId, id, "path"),
     );
     const base = this.crypto.encryptDraft(
-      input.content,
+      input.baseContent ?? input.content,
       this.aad(input.userId, id, "base"),
     );
     const current = this.crypto.encryptDraft(

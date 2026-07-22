@@ -7,12 +7,20 @@ import * as z from "zod/v4";
 import { BridgeRevisionConflictError } from "./bridge-client.ts";
 import { AuthorizationError, AuthenticationError } from "./auth.ts";
 import {
+  MINI_CANVAS_COMMAND_GUIDE,
+  MINI_CANVAS_SERVER_INSTRUCTIONS,
+} from "./command-guide.ts";
+import {
   DraftConflictError,
   DraftNotFoundError,
   DraftStateError,
 } from "./drafts.ts";
-import { MiniCanvasService, SearchNotReadyError } from "./service.ts";
-import type { Principal } from "./types.ts";
+import {
+  CommitPreviewRequiredError,
+  MiniCanvasService,
+  SearchNotReadyError,
+} from "./service.ts";
+import type { DraftSnapshot, Principal } from "./types.ts";
 import {
   MINI_CANVAS_WIDGET_URI,
   registerMiniCanvasWidget,
@@ -24,6 +32,7 @@ const draftOutputSchema = {
   path: z.string(),
   content: z.string(),
   baseRevision: z.string(),
+  isNew: z.boolean(),
   version: z.number().int(),
   status: z.enum(["active", "committed", "expired"]),
   createdAt: z.number().int(),
@@ -31,6 +40,32 @@ const draftOutputSchema = {
   expiresAt: z.number().int(),
   committedRevision: z.string().optional(),
 };
+
+const draftSummaryOutputSchema = z.object({
+  id: z.string().uuid(),
+  path: z.string(),
+  baseRevision: z.string(),
+  isNew: z.boolean(),
+  version: z.number().int(),
+  status: z.enum(["active", "committed", "expired"]),
+  createdAt: z.number().int(),
+  updatedAt: z.number().int(),
+  expiresAt: z.number().int(),
+  committedRevision: z.string().optional(),
+});
+
+function draftLaunchContent(draft: DraftSnapshot) {
+  return {
+    mode: "draft" as const,
+    draftId: draft.id,
+    path: draft.path,
+    title: draft.path.split("/").at(-1)?.replace(/\.md$/iu, "") ?? draft.path,
+    version: draft.version,
+    status: draft.status,
+    baseRevision: draft.baseRevision,
+    isNew: draft.isNew,
+  };
+}
 
 const entrySchema = z.object({
   path: z.string(),
@@ -54,6 +89,13 @@ const localWriteAnnotations = {
   destructiveHint: false,
 };
 
+const vaultCommitAnnotations = {
+  readOnlyHint: false,
+  openWorldHint: false,
+  destructiveHint: true,
+  idempotentHint: true,
+};
+
 // ChatGPT reaches this personal test-Vault server through a bound Secure MCP
 // Tunnel. The Tunnel authenticates to the local MCP with a private static
 // Bearer token, while the public App surface itself intentionally uses no OAuth.
@@ -66,6 +108,7 @@ function publicError(error: unknown): string {
     error instanceof AuthorizationError ||
     error instanceof DraftNotFoundError ||
     error instanceof DraftStateError ||
+    error instanceof CommitPreviewRequiredError ||
     error instanceof SearchNotReadyError
   ) {
     return error.message;
@@ -84,7 +127,10 @@ function publicError(error: unknown): string {
       actualRevision: error.actualRevision,
     });
   }
-  if (error instanceof Error && /必须|只支持|不存在|尚未|无效|过大/u.test(error.message)) {
+  if (
+    error instanceof Error &&
+    /必须|只支持|不存在|已存在|尚未|无效|过大/u.test(error.message)
+  ) {
     return error.message;
   }
   return "Mini Canvas 服务暂时无法完成请求";
@@ -135,12 +181,168 @@ export function createMiniCanvasMcpServer(
   const server = new McpServer(
     { name: "mini-canvas", version: "0.1.0" },
     {
-      instructions:
-        "Search or fetch a note before creating a draft. Preview every changed draft before commit_draft. Never guess draft versions or revisions; use the values returned by tools.",
+      instructions: MINI_CANVAS_SERVER_INSTRUCTIONS,
     },
   );
 
   registerMiniCanvasWidget(server);
+
+  server.registerPrompt(
+    "mini_canvas_commands",
+    {
+      title: "Mini Canvas shorthand commands",
+      description:
+        "Operator-friendly Chinese commands for opening, finding, editing, creating, resuming, previewing and committing Obsidian drafts.",
+    },
+    () => ({
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text: MINI_CANVAS_COMMAND_GUIDE,
+          },
+        },
+      ],
+    }),
+  );
+
+  server.registerPrompt(
+    "mini_canvas_edit_note",
+    {
+      title: "Edit an Obsidian note with Mini Canvas",
+      description:
+        "Safe cross-host workflow for editing an existing note through an encrypted draft.",
+      argsSchema: {
+        path: z.string().describe("Vault-relative path, or a distinctive title to search for."),
+        request: z.string().describe("The change the user wants to make."),
+      },
+    },
+    ({ path, request }) => ({
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text: [
+              `Edit the Obsidian note ${JSON.stringify(path)} as follows: ${request}`,
+              "Use Mini Canvas tools in this exact order:",
+              "1. Use search if the exact Vault-relative path is uncertain.",
+              "2. Use fetch to read the complete current Markdown.",
+              "3. Produce the complete revised Markdown, preserving unrelated content.",
+              "4. Call edit_note_in_mini_canvas with the exact path and complete content.",
+              "5. In an MCP Apps host, let the user review the rendered draft. In a text-only host, call get_draft and show a concise summary plus the returned Markdown for review.",
+              "6. Do not call commit_draft unless the user explicitly approves the reviewed draft.",
+            ].join("\n"),
+          },
+        },
+      ],
+    }),
+  );
+
+  server.registerPrompt(
+    "mini_canvas_create_note",
+    {
+      title: "Create an Obsidian note with Mini Canvas",
+      description:
+        "Safe cross-host workflow for preparing a new note without immediately writing to the Vault.",
+      argsSchema: {
+        path: z.string().describe("New Vault-relative .md path."),
+        request: z.string().describe("Topic and content requirements for the new note."),
+      },
+    },
+    ({ path, request }) => ({
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text: [
+              `Prepare a new Obsidian note at ${JSON.stringify(path)}: ${request}`,
+              "Write the complete Markdown, then call create_note_in_mini_canvas with path and content.",
+              "In an MCP Apps host, let the user review the rendered draft. In a text-only host, call get_draft and show a concise summary plus the returned Markdown for review.",
+              "Do not call commit_draft unless the user explicitly approves the reviewed draft.",
+            ].join("\n"),
+          },
+        },
+      ],
+    }),
+  );
+
+  registerAppTool(
+    server,
+    "create_note_in_mini_canvas",
+    {
+      title: "Create new note in Mini Canvas",
+      description:
+        "Use this when the user asks to create a NEW Obsidian Markdown note. Both path and complete Markdown content are required. This creates a visible encrypted draft only; it never writes to Obsidian until the user reviews and explicitly commits it.",
+      inputSchema: {
+        path: z
+          .string()
+          .describe("New Vault-relative path ending in .md. The note must not already exist."),
+        content: z
+          .string()
+          .describe("Complete initial Markdown content for the new note."),
+        expiresInHours: z.number().min(1).max(720).optional(),
+      },
+      outputSchema: {
+        mode: z.literal("draft"),
+        draftId: z.string().uuid(),
+        path: z.string(),
+        title: z.string(),
+        version: z.number().int(),
+        status: z.enum(["active", "committed", "expired"]),
+        baseRevision: z.string(),
+        isNew: z.literal(true),
+      },
+      annotations: localWriteAnnotations,
+      _meta: {
+        securitySchemes: noAuthSecuritySchemes,
+        ui: {
+          resourceUri: MINI_CANVAS_WIDGET_URI,
+          visibility: ["model", "app"],
+        },
+        "openai/outputTemplate": MINI_CANVAS_WIDGET_URI,
+        "openai/toolInvocation/invoking": "正在创建新笔记草稿…",
+        "openai/toolInvocation/invoked": "新笔记草稿已在 Mini Canvas 中打开",
+      },
+    },
+    async ({ path, content, expiresInHours }) => {
+      try {
+        const draft = await service.createDraft(principal, {
+          path,
+          content,
+          expiresInHours,
+          createIfMissing: true,
+        });
+        const structuredContent = {
+          mode: "draft" as const,
+          draftId: draft.id,
+          path: draft.path,
+          title: draft.path.split("/").at(-1)?.replace(/\.md$/iu, "") ?? draft.path,
+          version: draft.version,
+          status: draft.status,
+          baseRevision: draft.baseRevision,
+          isNew: true as const,
+        };
+        return {
+          structuredContent,
+          _meta: { draft },
+          content: [
+            {
+              type: "text" as const,
+              text: `已建立新笔记的加密草稿：${draft.path}（v${draft.version}）。支持 MCP Apps 的宿主会显示 Mini Canvas。尚未提交到 Obsidian。`,
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: publicError(error) }],
+        };
+      }
+    },
+  );
 
   registerAppTool(
     server,
@@ -148,7 +350,7 @@ export function createMiniCanvasMcpServer(
     {
       title: "Open Mini Canvas",
       description:
-        "Open the Mini Canvas editor. Optionally open an existing authorized Markdown note as an encrypted draft.",
+        "Open the Mini Canvas picker or an EXISTING authorized Markdown note. Never use this tool to create a new note; use create_note_in_mini_canvas instead. For changing an existing note, use edit_note_in_mini_canvas.",
       inputSchema: {
         path: z.string().optional(),
       },
@@ -160,6 +362,8 @@ export function createMiniCanvasMcpServer(
         version: z.number().int().optional(),
         status: z.enum(["active", "committed", "expired"]).optional(),
         baseRevision: z.string().optional(),
+        isNew: z.boolean().optional(),
+        resumed: z.boolean().optional(),
       },
       annotations: localWriteAnnotations,
       _meta: {
@@ -181,13 +385,144 @@ export function createMiniCanvasMcpServer(
             content: [
               {
                 type: "text" as const,
-                text: "Mini Canvas 已打开，请在 Widget 中选择一篇 Obsidian 笔记。",
+                text: "Mini Canvas 选择器已打开。支持 MCP Apps 的宿主会显示交互界面；纯文本宿主请改用 list_entries、search 或 fetch 选择笔记。",
               },
             ],
           };
         }
 
-        const draft = await service.createDraft(principal, { path });
+        const activeDraft = service.findActiveDraftByPath(principal, path);
+        const draft =
+          activeDraft ??
+          (await service.createDraft(principal, {
+            path,
+          }));
+        const structuredContent = {
+          ...draftLaunchContent(draft),
+          resumed: activeDraft !== null,
+        };
+        return {
+          structuredContent,
+          // The full draft is component-only bootstrap data. Keeping it in
+          // result metadata lets the Widget render immediately without a
+          // second tool call, while keeping note content out of model-visible
+          // structuredContent.
+          _meta: { draft },
+          content: [
+            {
+              type: "text" as const,
+              text: activeDraft
+                ? `已恢复活动草稿：${draft.path}（v${draft.version}）。支持 MCP Apps 的宿主会显示 Mini Canvas。`
+                : `已建立${draft.isNew ? "新笔记" : "已有笔记"}的加密草稿：${draft.path}（v${draft.version}）。支持 MCP Apps 的宿主会显示 Mini Canvas；纯文本宿主可调用 get_draft 获取正文。尚未提交到 Obsidian。`,
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: publicError(error) }],
+        };
+      }
+    },
+  );
+
+  registerAppTool(
+    server,
+    "open_draft_in_mini_canvas",
+    {
+      title: "Open existing draft in Mini Canvas",
+      description:
+        "Reopen the exact encrypted draft identified by draftId in the Mini Canvas Widget. Use list_drafts first when the draftId is unknown. This never creates or commits a note.",
+      inputSchema: {
+        draftId: z.string().uuid(),
+      },
+      outputSchema: {
+        mode: z.literal("draft"),
+        draftId: z.string().uuid(),
+        path: z.string(),
+        title: z.string(),
+        version: z.number().int(),
+        status: z.enum(["active", "committed", "expired"]),
+        baseRevision: z.string(),
+        isNew: z.boolean(),
+      },
+      annotations: readOnlyAnnotations,
+      _meta: {
+        securitySchemes: noAuthSecuritySchemes,
+        ui: {
+          resourceUri: MINI_CANVAS_WIDGET_URI,
+          visibility: ["model", "app"],
+        },
+        "openai/outputTemplate": MINI_CANVAS_WIDGET_URI,
+        "openai/toolInvocation/invoking": "正在恢复 Mini Canvas 草稿…",
+        "openai/toolInvocation/invoked": "Mini Canvas 草稿已恢复",
+      },
+    },
+    async ({ draftId }) => {
+      try {
+        const draft = service.getDraft(principal, draftId);
+        return {
+          structuredContent: draftLaunchContent(draft),
+          _meta: { draft },
+          content: [
+            {
+              type: "text" as const,
+              text: `已重新打开加密草稿：${draft.path}（v${draft.version}，${draft.status}）。尚未执行任何提交。`,
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: publicError(error) }],
+        };
+      }
+    },
+  );
+
+  registerAppTool(
+    server,
+    "edit_note_in_mini_canvas",
+    {
+      title: "Edit note in Mini Canvas",
+      description:
+        "Use this when the user asks to edit, rewrite, expand, correct, or fill an existing Obsidian Markdown note. Pass the complete revised Markdown; it opens as a visible encrypted draft and does not change Obsidian until preview and commit.",
+      inputSchema: {
+        path: z.string().describe("Vault-relative path of an existing .md note."),
+        content: z
+          .string()
+          .describe("Complete revised Markdown content that should appear in the draft."),
+        expiresInHours: z.number().min(1).max(720).optional(),
+      },
+      outputSchema: {
+        mode: z.literal("draft"),
+        draftId: z.string().uuid(),
+        path: z.string(),
+        title: z.string(),
+        version: z.number().int(),
+        status: z.enum(["active", "committed", "expired"]),
+        baseRevision: z.string(),
+        isNew: z.literal(false),
+      },
+      annotations: localWriteAnnotations,
+      _meta: {
+        securitySchemes: noAuthSecuritySchemes,
+        ui: {
+          resourceUri: MINI_CANVAS_WIDGET_URI,
+          visibility: ["model", "app"],
+        },
+        "openai/outputTemplate": MINI_CANVAS_WIDGET_URI,
+        "openai/toolInvocation/invoking": "正在把修改写入可见草稿…",
+        "openai/toolInvocation/invoked": "修改已在 Mini Canvas 中显示",
+      },
+    },
+    async ({ path, content, expiresInHours }) => {
+      try {
+        const draft = await service.createDraft(principal, {
+          path,
+          content,
+          expiresInHours,
+        });
         const structuredContent = {
           mode: "draft" as const,
           draftId: draft.id,
@@ -196,13 +531,15 @@ export function createMiniCanvasMcpServer(
           version: draft.version,
           status: draft.status,
           baseRevision: draft.baseRevision,
+          isNew: false as const,
         };
         return {
           structuredContent,
+          _meta: { draft },
           content: [
             {
               type: "text" as const,
-              text: `Mini Canvas 已打开加密草稿：${draft.path}（v${draft.version}）。`,
+              text: `已将完整修改写入加密草稿：${draft.path}（v${draft.version}）。支持 MCP Apps 的宿主会显示 Mini Canvas；纯文本宿主可调用 get_draft 获取正文供用户审阅。尚未提交到 Obsidian。`,
             },
           ],
         };
@@ -321,44 +658,150 @@ export function createMiniCanvasMcpServer(
     },
   );
 
-  server.registerTool(
+  registerAppTool(
+    server,
     "create_draft",
     {
       title: "Create note draft",
-      description: "Create an encrypted draft from an existing authorized Markdown note.",
+      description:
+        "Low-level tool for opening an EXISTING Markdown note as a visible encrypted draft. To create a new note, always use create_note_in_mini_canvas.",
       inputSchema: {
         path: z.string(),
         expiresInHours: z.number().min(1).max(720).optional(),
       },
-      outputSchema: draftOutputSchema,
+      outputSchema: {
+        ...draftOutputSchema,
+        mode: z.literal("draft"),
+        draftId: z.string().uuid(),
+      },
       annotations: localWriteAnnotations,
-      _meta: noAuthToolMeta,
+      _meta: {
+        ...noAuthToolMeta,
+        ui: {
+          resourceUri: MINI_CANVAS_WIDGET_URI,
+          visibility: ["model", "app"],
+        },
+        "openai/outputTemplate": MINI_CANVAS_WIDGET_URI,
+        "openai/toolInvocation/invoking": "正在创建可见草稿…",
+        "openai/toolInvocation/invoked": "草稿已在 Mini Canvas 中打开",
+      },
     },
-    async (input) =>
+    async (input) => {
+      try {
+        const draft = await service.createDraft(principal, input);
+        return {
+          structuredContent: {
+            ...draft,
+            mode: "draft" as const,
+            draftId: draft.id,
+          },
+          _meta: { draft },
+          content: [
+            {
+              type: "text" as const,
+              text: `加密草稿已建立：${draft.path}（v${draft.version}）。支持 MCP Apps 的宿主会显示 Mini Canvas；纯文本宿主可调用 get_draft 获取正文。`,
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: publicError(error) }],
+        };
+      }
+    },
+  );
+
+  registerAppTool(
+    server,
+    "list_drafts",
+    {
+      title: "List encrypted drafts",
+      description:
+        "List the caller's encrypted draft metadata without exposing draft bodies. Use this to recover a draftId, then call open_draft_in_mini_canvas to render that exact draft.",
+      inputSchema: {
+        path: z.string().optional(),
+        status: z.enum(["active", "committed", "expired"]).optional(),
+        limit: z.number().int().min(1).max(100).optional(),
+      },
+      outputSchema: {
+        drafts: z.array(draftSummaryOutputSchema),
+        count: z.number().int(),
+      },
+      annotations: readOnlyAnnotations,
+      _meta: {
+        ...noAuthToolMeta,
+        ui: { visibility: ["model", "app"] },
+      },
+    },
+    (input) =>
       toolResult(
-        () => service.createDraft(principal, input),
-        (draft) => JSON.stringify(draft),
+        () => {
+          const drafts = service.listDrafts(principal, input);
+          return { drafts, count: drafts.length };
+        },
+        ({ drafts, count }) =>
+          count === 0
+            ? "没有找到符合条件的草稿。"
+            : `找到 ${count} 个草稿：${drafts
+                .map(
+                  (draft) =>
+                    `${draft.path}（${draft.status}，v${draft.version}，draftId=${draft.id}）`,
+                )
+                .join("；")}`,
       ),
   );
 
-  server.registerTool(
+  registerAppTool(
+    server,
     "get_draft",
     {
       title: "Get note draft",
       description: "Read the caller's encrypted draft and current optimistic version.",
       inputSchema: { draftId: z.string().uuid() },
-      outputSchema: draftOutputSchema,
+      outputSchema: {
+        ...draftOutputSchema,
+        mode: z.literal("draft"),
+        draftId: z.string().uuid(),
+      },
       annotations: readOnlyAnnotations,
-      _meta: noAuthToolMeta,
+      _meta: {
+        ...noAuthToolMeta,
+        ui: {
+          resourceUri: MINI_CANVAS_WIDGET_URI,
+          visibility: ["model", "app"],
+        },
+        "openai/outputTemplate": MINI_CANVAS_WIDGET_URI,
+      },
     },
-    async ({ draftId }) =>
-      toolResult(
-        () => service.getDraft(principal, draftId),
-        (draft) => JSON.stringify(draft),
-      ),
+    async ({ draftId }) => {
+      try {
+        const draft = service.getDraft(principal, draftId);
+        return {
+          structuredContent: {
+            ...draft,
+            mode: "draft" as const,
+            draftId: draft.id,
+          },
+          _meta: { draft },
+          content: [
+            {
+              type: "text" as const,
+              text: `已读取草稿：${draft.path}（v${draft.version}）。正文位于 structuredContent.content；支持 MCP Apps 的宿主也会显示 Mini Canvas。`,
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: publicError(error) }],
+        };
+      }
+    },
   );
 
-  server.registerTool(
+  registerAppTool(
+    server,
     "update_draft",
     {
       title: "Update note draft",
@@ -368,15 +811,47 @@ export function createMiniCanvasMcpServer(
         content: z.string(),
         expectedVersion: z.number().int().min(1),
       },
-      outputSchema: draftOutputSchema,
+      outputSchema: {
+        ...draftOutputSchema,
+        mode: z.literal("draft"),
+        draftId: z.string().uuid(),
+      },
       annotations: localWriteAnnotations,
-      _meta: noAuthToolMeta,
+      _meta: {
+        ...noAuthToolMeta,
+        ui: {
+          resourceUri: MINI_CANVAS_WIDGET_URI,
+          visibility: ["model", "app"],
+        },
+        "openai/outputTemplate": MINI_CANVAS_WIDGET_URI,
+        "openai/toolInvocation/invoking": "正在更新可见草稿…",
+        "openai/toolInvocation/invoked": "草稿已在 Mini Canvas 中更新",
+      },
     },
-    async (input) =>
-      toolResult(
-        () => service.updateDraft(principal, input),
-        (draft) => JSON.stringify(draft),
-      ),
+    async (input) => {
+      try {
+        const draft = service.updateDraft(principal, input);
+        return {
+          structuredContent: {
+            ...draft,
+            mode: "draft" as const,
+            draftId: draft.id,
+          },
+          _meta: { draft },
+          content: [
+            {
+              type: "text" as const,
+              text: `草稿内容已更新：${draft.path}（v${draft.version}）。支持 MCP Apps 的宿主会显示 Mini Canvas；纯文本宿主可再次调用 get_draft 审阅正文。`,
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: publicError(error) }],
+        };
+      }
+    },
   );
 
   server.registerTool(
@@ -392,7 +867,9 @@ export function createMiniCanvasMcpServer(
         draftId: z.string(),
         path: z.string(),
         version: z.number().int(),
+        confirmationToken: z.string().min(32),
         baseRevision: z.string(),
+        isNew: z.boolean(),
         changed: z.boolean(),
         characterDelta: z.number().int(),
         lineDelta: z.number().int(),
@@ -418,6 +895,7 @@ export function createMiniCanvasMcpServer(
         draftId: z.string().uuid(),
         expectedVersion: z.number().int().min(1),
         idempotencyKey: z.string().min(16),
+        confirmationToken: z.string().min(32),
       },
       outputSchema: {
         draft: z.object(draftOutputSchema),
@@ -432,7 +910,7 @@ export function createMiniCanvasMcpServer(
           idempotentReplay: z.boolean(),
         }),
       },
-      annotations: localWriteAnnotations,
+      annotations: vaultCommitAnnotations,
       _meta: noAuthToolMeta,
     },
     async (input) =>

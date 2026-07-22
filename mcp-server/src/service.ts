@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { extname } from "node:path";
 
 import type {
@@ -8,13 +8,16 @@ import type {
   ListVaultEntriesResult,
   NoteSnapshot,
 } from "../../livesync-bridge/src/types.ts";
+import { NEW_NOTE_EXPECTED_REVISION } from "../../livesync-bridge/src/types.ts";
 import { Authorizer } from "./auth.ts";
-import type { NoteGateway } from "./bridge-client.ts";
+import { BridgeHttpError, type NoteGateway } from "./bridge-client.ts";
 import { DraftConflictError, DraftRepository, DraftStateError } from "./drafts.ts";
 import { createSnippet, SearchCoordinator } from "./search.ts";
 import type {
   CommitPreview,
   DraftSnapshot,
+  DraftStatus,
+  DraftSummary,
   Principal,
   SearchResult,
 } from "./types.ts";
@@ -33,11 +36,29 @@ export class SearchNotReadyError extends Error {
   }
 }
 
+export class CommitPreviewRequiredError extends Error {
+  constructor() {
+    super("提交确认无效或已过期，请重新生成并审核提交预览");
+    this.name = "CommitPreviewRequiredError";
+  }
+}
+
+type CommitConfirmation = {
+  userId: string;
+  draftId: string;
+  version: number;
+  contentSha256: string;
+  expiresAt: number;
+};
+
+const COMMIT_CONFIRMATION_TTL_MS = 10 * 60 * 1_000;
+
 export class MiniCanvasService {
   private readonly gateway: NoteGateway;
   private readonly drafts: DraftRepository;
   private readonly search: SearchCoordinator;
   private readonly authorizer: Authorizer;
+  private readonly commitConfirmations = new Map<string, CommitConfirmation>();
 
   constructor(options: {
     gateway: NoteGateway;
@@ -80,19 +101,48 @@ export class MiniCanvasService {
 
   async createDraft(
     principal: Principal,
-    input: { path: string; expiresInHours?: number },
+    input: {
+      path: string;
+      expiresInHours?: number;
+      createIfMissing?: boolean;
+      content?: string;
+    },
   ): Promise<DraftSnapshot> {
     this.authorizer.requireScope(principal, "notes:read");
     this.authorizer.requireScope(principal, "drafts:write");
     const path = this.authorizer.requirePath(principal, input.path);
     if (extname(path).toLowerCase() !== ".md") {
-      throw new Error("第一版草稿只支持已有 Markdown 笔记");
+      throw new Error("草稿只支持 Markdown 笔记（.md）");
     }
-    const note = await this.gateway.readNote(path);
+    let note: NoteSnapshot;
+    try {
+      note = await this.gateway.readNote(path);
+    } catch (error) {
+      const missing =
+        error instanceof BridgeHttpError &&
+        error.status === 404 &&
+        error.code === "note_not_found";
+      if (!missing) throw error;
+      if (!input.createIfMissing) {
+        throw new Error("目标笔记不存在，无法编辑；若要新建请使用新建笔记流程");
+      }
+      return this.drafts.create({
+        userId: principal.userId,
+        path,
+        content: input.content ?? "",
+        baseContent: "",
+        baseRevision: NEW_NOTE_EXPECTED_REVISION,
+        expiresInHours: input.expiresInHours,
+      });
+    }
+    if (input.createIfMissing && input.content !== undefined) {
+      throw new Error("目标笔记已经存在；请先打开已有笔记再编辑，未覆盖原文");
+    }
     return this.drafts.create({
       userId: principal.userId,
       path: note.path,
-      content: note.content,
+      content: input.content ?? note.content,
+      baseContent: note.content,
       baseRevision: note.revision,
       expiresInHours: input.expiresInHours,
     });
@@ -103,6 +153,37 @@ export class MiniCanvasService {
     const draft = this.drafts.get(draftId, principal.userId);
     this.authorizer.requirePath(principal, draft.path);
     return draft;
+  }
+
+  listDrafts(
+    principal: Principal,
+    input: { path?: string; status?: DraftStatus; limit?: number } = {},
+  ): DraftSummary[] {
+    this.authorizer.requireScope(principal, "drafts:write");
+    const path =
+      input.path === undefined
+        ? undefined
+        : this.authorizer.requirePath(principal, input.path);
+    return this.drafts
+      .list(principal.userId, {
+        ...input,
+        ...(path === undefined ? {} : { path }),
+      })
+      .filter((draft) => this.authorizer.canAccessPath(principal, draft.path));
+  }
+
+  findActiveDraftByPath(
+    principal: Principal,
+    rawPath: string,
+  ): DraftSnapshot | null {
+    this.authorizer.requireScope(principal, "drafts:write");
+    const path = this.authorizer.requirePath(principal, rawPath);
+    const summary = this.drafts.list(principal.userId, {
+      path,
+      status: "active",
+      limit: 1,
+    })[0];
+    return summary ? this.drafts.get(summary.id, principal.userId) : null;
   }
 
   updateDraft(
@@ -131,15 +212,32 @@ export class MiniCanvasService {
     if (draft.version !== input.expectedVersion) {
       throw new DraftConflictError(input.expectedVersion, draft.version);
     }
+    const contentSha256 = createHash("sha256")
+      .update(draft.content, "utf8")
+      .digest("hex");
+    const confirmationToken = randomBytes(32).toString("base64url");
+    const now = Date.now();
+    for (const [token, confirmation] of this.commitConfirmations) {
+      if (confirmation.expiresAt <= now) this.commitConfirmations.delete(token);
+    }
+    this.commitConfirmations.set(confirmationToken, {
+      userId: principal.userId,
+      draftId: draft.id,
+      version: draft.version,
+      contentSha256,
+      expiresAt: now + COMMIT_CONFIRMATION_TTL_MS,
+    });
     return {
       draftId: draft.id,
       path: draft.path,
       version: draft.version,
+      confirmationToken,
       baseRevision: draft.baseRevision,
-      changed: draft.content !== draft.baseContent,
+      isNew: draft.isNew,
+      changed: draft.isNew || draft.content !== draft.baseContent,
       characterDelta: [...draft.content].length - [...draft.baseContent].length,
       lineDelta: lineCount(draft.content) - lineCount(draft.baseContent),
-      contentSha256: createHash("sha256").update(draft.content, "utf8").digest("hex"),
+      contentSha256,
     };
   }
 
@@ -149,6 +247,7 @@ export class MiniCanvasService {
       draftId: string;
       expectedVersion: number;
       idempotencyKey: string;
+      confirmationToken: string;
     },
   ): Promise<{ draft: DraftSnapshot; note: CommitNoteResult }> {
     this.authorizer.requireScope(principal, "drafts:commit");
@@ -165,6 +264,21 @@ export class MiniCanvasService {
         draft: this.drafts.get(draft.id, principal.userId),
         note: { ...current, idempotentReplay: true },
       };
+    }
+    const confirmation = this.commitConfirmations.get(input.confirmationToken);
+    const contentSha256 = createHash("sha256")
+      .update(draft.content, "utf8")
+      .digest("hex");
+    if (
+      !confirmation ||
+      confirmation.expiresAt <= Date.now() ||
+      confirmation.userId !== principal.userId ||
+      confirmation.draftId !== draft.id ||
+      confirmation.version !== draft.version ||
+      confirmation.contentSha256 !== contentSha256
+    ) {
+      if (confirmation) this.commitConfirmations.delete(input.confirmationToken);
+      throw new CommitPreviewRequiredError();
     }
     const note = await this.gateway.commitNote({
       path: draft.path,

@@ -15,6 +15,7 @@ import type {
   LiveSyncMetadataDocument,
   NoteSnapshot,
 } from "../src/types.ts";
+import { NEW_NOTE_EXPECTED_REVISION } from "../src/types.ts";
 
 test("escapes CouchDB-reserved path prefixes as ordinary LiveSync IDs", () => {
   const id = liveSyncPathToDocumentId("_design/views/note.md", true);
@@ -194,6 +195,46 @@ function createTestBridge(): LiveSyncBridge {
     caseInsensitive: true,
   });
 }
+
+test("creates a new LiveSync note only when the path is absent", async () => {
+  const bridge = createTestBridge();
+  const writes: Array<Record<string, unknown>> = [];
+  Object.defineProperty(bridge, "couch", {
+    value: {
+      getLocalDocumentOrNull: async () => null,
+      getDocumentOrNull: async () => null,
+      putDocument: async (document: Record<string, unknown>) => {
+        writes.push(document);
+        return { ok: true as const, id: String(document._id), rev: "1-created" };
+      },
+      putLocalDocument: async () => ({
+        ok: true as const,
+        id: "commit-record",
+        rev: "0-1",
+      }),
+    },
+  });
+  const internals = bridge as unknown as {
+    ensureChunk(content: string): Promise<string>;
+  };
+  internals.ensureChunk = async () => "h:new-content";
+
+  const result = await bridge.commitNote({
+    path: "Notes/Binomial theorem.md",
+    content: "# 二项式定理\n",
+    expectedRevision: NEW_NOTE_EXPECTED_REVISION,
+    idempotencyKey: "create-binomial-note",
+  });
+
+  const written = writes[0];
+  assert.ok(written);
+  assert.equal(written._id, "notes/binomial theorem.md");
+  assert.equal(Object.hasOwn(written, "_rev"), false);
+  assert.equal(written.path, "Notes/Binomial theorem.md");
+  assert.equal(result.revision, "1-created");
+  assert.equal(result.content, "# 二项式定理\n");
+  assert.equal(result.idempotentReplay, false);
+});
 
 test("turns a final metadata 409 into a revision conflict", async () => {
   const bridge = createTestBridge();

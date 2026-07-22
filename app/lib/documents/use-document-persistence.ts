@@ -37,7 +37,7 @@ export type DocumentPersistenceActions = {
   enqueueSave(
     repository: DocumentRepository,
     options?: EnqueueSaveOptions,
-  ): Promise<void>;
+  ): Promise<SaveOutcome>;
   setRecoveryAvailable(available: boolean): void;
   reportError(): void;
   resolveConflict(strategy: ConflictResolution, confirmation: string): void;
@@ -84,8 +84,10 @@ export function useDocumentPersistence(
     async (
       repository: DocumentRepository,
       options?: EnqueueSaveOptions,
-    ): Promise<void> => {
-      applySaveOutcome(await runtime.persist(repository, options));
+    ): Promise<SaveOutcome> => {
+      const outcome = await runtime.persist(repository, options);
+      applySaveOutcome(outcome);
+      return outcome;
     },
     [applySaveOutcome, runtime],
   );

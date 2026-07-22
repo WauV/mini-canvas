@@ -179,6 +179,7 @@ export function MiniCanvas({ hostMode = "page" }: MiniCanvasProps = {}) {
   };
 
   const updateContent = (content: string) => {
+    if (mcpBusy) return;
     if (isWidget && !mcpDraft) return;
     if (mcpDraft?.status !== undefined && mcpDraft.status !== "active") return;
     documents.update({ content });
@@ -259,6 +260,7 @@ export function MiniCanvas({ hostMode = "page" }: MiniCanvasProps = {}) {
           onChange={updateContent}
           livePreviewInteractions={livePreviewInteractions}
           readOnly={
+            mcpBusy ||
             (isWidget && !mcpDraft) ||
             mcpDraft?.status === "committed" ||
             mcpDraft?.status === "expired"

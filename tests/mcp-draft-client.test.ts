@@ -42,6 +42,7 @@ function draft(content = "# 原文", version = 1): DraftSnapshot {
     path: "Notes/Test.md",
     content,
     baseRevision: "1-base",
+    isNew: false,
     version,
     status: "active",
     createdAt: 1,
@@ -86,7 +87,9 @@ class FakeTools implements McpToolClient {
           draftId: this.current.id,
           path: this.current.path,
           version: this.current.version,
+          confirmationToken: "p".repeat(43),
           baseRevision: this.current.baseRevision,
+          isNew: this.current.isNew,
           changed: true,
           characterDelta: 4,
           lineDelta: 1,
@@ -217,6 +220,7 @@ test("MCP draft repository commits the previewed version and becomes committed",
   const result = await repository.commit(
     "1",
     "editor-test-idempotency-key-0001",
+    "p".repeat(43),
   );
 
   assert.equal(result.draft.status, "committed");
@@ -250,6 +254,7 @@ test("MCP client exposes a Bridge revision conflict without losing the draft", a
       draftId: draft().id,
       expectedVersion: 1,
       idempotencyKey: "editor-test-idempotency-key-0002",
+      confirmationToken: "p".repeat(43),
     }),
     (error: unknown) =>
       error instanceof McpRevisionConflictError &&
@@ -407,6 +412,7 @@ test("MCP client validates list and commit result field types", async () => {
       draftId: draft().id,
       expectedVersion: 1,
       idempotencyKey: "test-key",
+      confirmationToken: "p".repeat(43),
     }),
     /字段 size 格式无效/u,
   );

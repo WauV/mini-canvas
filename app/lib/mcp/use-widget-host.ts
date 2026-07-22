@@ -1,13 +1,17 @@
 "use client";
 
 import { useCallback, useEffect, useRef } from "react";
-import type { DraftSnapshot, MiniCanvasMcpClient } from "./mini-canvas-client";
+import {
+  parseDraftSnapshot,
+  type DraftSnapshot,
+  type MiniCanvasMcpClient,
+} from "./mini-canvas-client";
 import type { McpToolResult } from "./tool-client";
 import type { McpNoticeValue } from "../../components/canvas/types";
 
 export type WidgetLaunch =
   | { mode: "picker" }
-  | { mode: "draft"; draftId: string };
+  | { mode: "draft"; draftId: string; draft?: DraftSnapshot };
 
 function resultText(result: McpToolResult): string | null {
   for (const item of result.content ?? []) {
@@ -27,7 +31,14 @@ export function parseWidgetLaunch(result: McpToolResult): WidgetLaunch {
   const launch = value as Record<string, unknown>;
   if (launch.mode === "picker") return { mode: "picker" };
   if (launch.mode === "draft" && typeof launch.draftId === "string") {
-    return { mode: "draft", draftId: launch.draftId };
+    const metadata = result._meta;
+    return {
+      mode: "draft",
+      draftId: launch.draftId,
+      ...(metadata?.draft === undefined
+        ? {}
+        : { draft: parseDraftSnapshot(metadata.draft) }),
+    };
   }
   throw new Error("Widget 没有收到可打开的草稿");
 }
@@ -73,6 +84,11 @@ export function useWidgetHost({
       }
       if (launch.mode === "picker") {
         onOpenPicker();
+        return;
+      }
+
+      if (launch.draft) {
+        onActivateDraft(launch.draft);
         return;
       }
 

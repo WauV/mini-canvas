@@ -1,0 +1,47 @@
+{
+	email {$ACME_EMAIL}
+	admin off
+}
+
+{$MCP_DOMAIN} {
+	@health path /healthz
+	respond @health "ok" 200
+
+	@internalHealth path /health
+	respond @internalHealth 404
+
+	request_body {
+		max_size 25MB
+	}
+
+	reverse_proxy mcp-server:3220 {
+		flush_interval -1
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+
+{$COUCHDB_DOMAIN} {
+	@administration path /_node/* /_cluster_setup* /_membership* /_utils/*
+	respond @administration 404
+
+	request_body {
+		max_size 4GB
+	}
+
+	reverse_proxy couchdb:5984 {
+		flush_interval -1
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}

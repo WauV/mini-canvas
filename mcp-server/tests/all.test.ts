@@ -5,7 +5,9 @@ import { readFileSync, rmSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AddressInfo } from "node:net";
 import test from "node:test";
+import { gunzipSync } from "node:zlib";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -19,19 +21,26 @@ import type {
   NoteSnapshot,
   VaultChangeBatch,
 } from "../../livesync-bridge/src/types.ts";
+import { NEW_NOTE_EXPECTED_REVISION } from "../../livesync-bridge/src/types.ts";
 import {
   Authorizer,
   AuthorizationError,
   StaticTokenVerifier,
   principalFromAuth,
 } from "../src/auth.ts";
-import type { NoteGateway } from "../src/bridge-client.ts";
+import { BridgeHttpError, type NoteGateway } from "../src/bridge-client.ts";
 import { AtRestCrypto } from "../src/crypto.ts";
 import { McpDatabase } from "../src/database.ts";
 import { DraftConflictError, DraftRepository } from "../src/drafts.ts";
 import { createMiniCanvasMcpServer } from "../src/mcp.ts";
 import { SearchCoordinator, SearchIndex, tokenizeSearchText } from "../src/search.ts";
-import { MiniCanvasService } from "../src/service.ts";
+import type { McpConfig } from "../src/config.ts";
+import type { McpRuntime } from "../src/runtime.ts";
+import { startMcpHttpServer } from "../src/server.ts";
+import {
+  CommitPreviewRequiredError,
+  MiniCanvasService,
+} from "../src/service.ts";
 import type { Principal } from "../src/types.ts";
 import { MINI_CANVAS_WIDGET_URI } from "../src/widget.ts";
 
@@ -47,11 +56,27 @@ class FakeGateway implements NoteGateway {
 
   async readNote(path: string): Promise<NoteSnapshot> {
     const note = this.notes.get(path);
-    if (!note) throw new Error("note missing");
+    if (!note) throw new BridgeHttpError(404, { error: "note_not_found" });
     return { ...note, children: [...note.children] };
   }
 
   async commitNote(input: CommitNoteInput): Promise<CommitNoteResult> {
+    if (input.expectedRevision === NEW_NOTE_EXPECTED_REVISION) {
+      if (this.notes.has(input.path)) {
+        throw new BridgeHttpError(409, { error: "revision_conflict" });
+      }
+      const created: NoteSnapshot = {
+        path: input.path,
+        content: input.content,
+        revision: "1-created",
+        ctime: Date.now(),
+        mtime: Date.now(),
+        size: Buffer.byteLength(input.content, "utf8"),
+        children: ["created-chunk"],
+      };
+      this.notes.set(input.path, created);
+      return { ...created, idempotentReplay: false };
+    }
     const note = await this.readNote(input.path);
     if (note.revision !== input.expectedRevision) throw new Error("revision conflict");
     const revision = `${Number(note.revision.split("-", 1)[0] || 0) + 1}-fake`;
@@ -142,6 +167,64 @@ test("static tokens produce a server-side principal and path boundaries are enfo
     },
   ]);
   await assert.rejects(() => expiredVerifier.verifyAccessToken("c".repeat(32)));
+});
+
+test("HTTP MCP accepts complete Markdown requests larger than Express' old 100 KB default", async () => {
+  const database = new McpDatabase(":memory:");
+  const crypto = new AtRestCrypto(masterKey);
+  const gateway = new FakeGateway();
+  const search = new SearchCoordinator(new SearchIndex(database, crypto), gateway);
+  const drafts = new DraftRepository(database, crypto);
+  const service = new MiniCanvasService({ gateway, drafts, search });
+  const token = "h".repeat(32);
+  const config: McpConfig = {
+    host: "127.0.0.1",
+    port: 0,
+    allowedHosts: ["127.0.0.1", "localhost", "[::1]"],
+    databasePath: ":memory:",
+    masterKey,
+    tokens: [{ ...principal, token }],
+    bridgeUrl: "http://127.0.0.1:27124",
+    bridgeToken: "b".repeat(32),
+    autoIndex: false,
+    caseInsensitivePaths: false,
+    draftRetentionDays: 30,
+  };
+  const runtime = {
+    database,
+    drafts,
+    gateway,
+    search,
+    service,
+    verifier: new StaticTokenVerifier(config.tokens),
+  } as unknown as McpRuntime;
+  const httpServer = await startMcpHttpServer(config, runtime);
+  try {
+    const address = httpServer.address() as AddressInfo;
+    const body = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/list",
+      params: { padding: "x".repeat(150_000) },
+    });
+    assert.ok(Buffer.byteLength(body, "utf8") > 100_000);
+    const response = await fetch(`http://127.0.0.1:${address.port}/mcp`, {
+      method: "POST",
+      headers: {
+        Accept: "application/json, text/event-stream",
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body,
+    });
+    assert.notEqual(response.status, 413);
+    await response.arrayBuffer();
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      httpServer.close((error) => (error ? reject(error) : resolve())),
+    );
+    database.close();
+  }
 });
 
 test("drafts are encrypted at rest and use optimistic versions", async () => {
@@ -264,6 +347,43 @@ test("case-insensitive search document IDs remove deleted Windows paths", () => 
   database.close();
 });
 
+test("search does not advance its checkpoint when an upsert cannot be indexed", async () => {
+  class TemporarilyUnavailableGateway extends FakeGateway {
+    override async readNote(): Promise<NoteSnapshot> {
+      throw new BridgeHttpError(503, { error: "bridge_unavailable" });
+    }
+  }
+
+  const database = new McpDatabase(":memory:");
+  const index = new SearchIndex(database, new AtRestCrypto(masterKey));
+  index.setSequence("5-before-failure");
+  const search = new SearchCoordinator(index, new TemporarilyUnavailableGateway());
+  const internal = search as unknown as {
+    applyBatch(batch: VaultChangeBatch): Promise<void>;
+  };
+
+  await assert.rejects(
+    internal.applyBatch({
+      events: [
+        {
+          sequence: "6-after-failure",
+          documentId: "Notes/Temporarily unavailable.md",
+          operation: "upsert",
+          kind: "note",
+          path: "Notes/Temporarily unavailable.md",
+          revision: "2-change",
+          mimeType: "text/markdown; charset=utf-8",
+        },
+      ],
+      nextSequence: "6-after-failure",
+      pending: 0,
+    }),
+    BridgeHttpError,
+  );
+  assert.equal(index.getSequence(), "5-before-failure");
+  database.close();
+});
+
 test("service completes draft preview and commit through the gateway", async () => {
   const database = new McpDatabase(":memory:");
   const crypto = new AtRestCrypto(masterKey);
@@ -282,6 +402,15 @@ test("service completes draft preview and commit through the gateway", async () 
     content: "# Updated\n\n中文内容",
     expectedVersion: 1,
   });
+  await assert.rejects(
+    service.commitDraft(principal, {
+      draftId: draft.id,
+      expectedVersion: changed.version,
+      idempotencyKey: "unpreviewed-idempotency-key-0001",
+      confirmationToken: "invalid-preview-token".padEnd(43, "x"),
+    }),
+    CommitPreviewRequiredError,
+  );
   const preview = service.previewCommit(principal, {
     draftId: draft.id,
     expectedVersion: changed.version,
@@ -291,9 +420,101 @@ test("service completes draft preview and commit through the gateway", async () 
     draftId: draft.id,
     expectedVersion: changed.version,
     idempotencyKey: "test-idempotency-key-0001",
+    confirmationToken: preview.confirmationToken,
   });
   assert.equal(committed.draft.status, "committed");
   assert.equal((await gateway.readNote("Notes/Test.md")).content, "# Updated\n\n中文内容");
+  database.close();
+});
+
+test("service can prefill a visible draft with a complete edit of an existing note", async () => {
+  const database = new McpDatabase(":memory:");
+  const crypto = new AtRestCrypto(masterKey);
+  const gateway = new FakeGateway();
+  gateway.notes.set("Notes/Edit.md", note("Notes/Edit.md", "# Original\n"));
+  const service = new MiniCanvasService({
+    gateway,
+    drafts: new DraftRepository(database, crypto),
+    search: new SearchCoordinator(new SearchIndex(database, crypto), gateway),
+  });
+
+  const draft = await service.createDraft(principal, {
+    path: "Notes/Edit.md",
+    content: "# Revised\n\nComplete replacement.",
+  });
+  assert.equal(draft.isNew, false);
+  assert.equal(draft.content, "# Revised\n\nComplete replacement.");
+  assert.equal((await gateway.readNote("Notes/Edit.md")).content, "# Original\n");
+  const preview = service.previewCommit(principal, {
+    draftId: draft.id,
+    expectedVersion: draft.version,
+  });
+  assert.equal(preview.changed, true);
+  assert.equal(preview.isNew, false);
+  database.close();
+});
+
+test("service prepares and commits a collision-safe new Markdown note", async () => {
+  const database = new McpDatabase(":memory:");
+  const crypto = new AtRestCrypto(masterKey);
+  const gateway = new FakeGateway();
+  const search = new SearchCoordinator(new SearchIndex(database, crypto), gateway);
+  const service = new MiniCanvasService({
+    gateway,
+    drafts: new DraftRepository(database, crypto),
+    search,
+  });
+  const content = "# 二项式定理\n\n$$(a+b)^n=\\sum_{k=0}^{n}\\binom{n}{k}a^{n-k}b^k$$";
+
+  const draft = await service.createDraft(principal, {
+    path: "Notes/二项式定理.md",
+    createIfMissing: true,
+    content,
+  });
+  assert.equal(draft.isNew, true);
+  assert.equal(draft.baseRevision, NEW_NOTE_EXPECTED_REVISION);
+  assert.equal(draft.content, content);
+
+  const preview = service.previewCommit(principal, {
+    draftId: draft.id,
+    expectedVersion: draft.version,
+  });
+  assert.equal(preview.isNew, true);
+  assert.equal(preview.changed, true);
+
+  const committed = await service.commitDraft(principal, {
+    draftId: draft.id,
+    expectedVersion: draft.version,
+    idempotencyKey: "new-note-idempotency-0001",
+    confirmationToken: preview.confirmationToken,
+  });
+  assert.equal(committed.draft.status, "committed");
+  assert.equal(committed.note.revision, "1-created");
+  assert.equal((await gateway.readNote("Notes/二项式定理.md")).content, content);
+  database.close();
+});
+
+test("new-note drafts refuse to replace a note that already exists", async () => {
+  const database = new McpDatabase(":memory:");
+  const crypto = new AtRestCrypto(masterKey);
+  const gateway = new FakeGateway();
+  gateway.notes.set("Notes/Existing.md", note("Notes/Existing.md", "# Keep me"));
+  const service = new MiniCanvasService({
+    gateway,
+    drafts: new DraftRepository(database, crypto),
+    search: new SearchCoordinator(new SearchIndex(database, crypto), gateway),
+  });
+
+  await assert.rejects(
+    () =>
+      service.createDraft(principal, {
+        path: "Notes/Existing.md",
+        createIfMissing: true,
+        content: "# Replace me",
+      }),
+    /已经存在/u,
+  );
+  assert.equal((await gateway.readNote("Notes/Existing.md")).content, "# Keep me");
   database.close();
 });
 
@@ -314,7 +535,7 @@ test("MCP exposes the Widget resource, annotated tools and encrypted draft launc
   await server.connect(serverTransport);
   await client.connect(clientTransport);
   const tools = await client.listTools();
-  assert.equal(tools.tools.length, 11);
+  assert.equal(tools.tools.length, 15);
   assert.equal(tools.tools.every((tool) => tool.annotations?.readOnlyHint !== undefined), true);
   assert.equal(
     tools.tools.every((tool) =>
@@ -325,16 +546,88 @@ test("MCP exposes the Widget resource, annotated tools and encrypted draft launc
     true,
   );
   const openTool = tools.tools.find((tool) => tool.name === "open_mini_canvas");
+  const editTool = tools.tools.find(
+    (tool) => tool.name === "edit_note_in_mini_canvas",
+  );
+  const createTool = tools.tools.find(
+    (tool) => tool.name === "create_note_in_mini_canvas",
+  );
+  const reopenTool = tools.tools.find(
+    (tool) => tool.name === "open_draft_in_mini_canvas",
+  );
+  const commitTool = tools.tools.find((tool) => tool.name === "commit_draft");
   assert.equal(
     (openTool?._meta?.ui as { resourceUri?: string } | undefined)?.resourceUri,
     MINI_CANVAS_WIDGET_URI,
   );
   assert.equal(openTool?._meta?.["ui/resourceUri"], MINI_CANVAS_WIDGET_URI);
+  assert.equal(
+    (editTool?._meta?.ui as { resourceUri?: string } | undefined)?.resourceUri,
+    MINI_CANVAS_WIDGET_URI,
+  );
+  assert.match(editTool?.description ?? "", /^Use this when/u);
+  assert.match(createTool?.description ?? "", /create a NEW/u);
+  assert.deepEqual(createTool?.inputSchema.required?.sort(), ["content", "path"]);
+  assert.equal(
+    (createTool?._meta?.ui as { resourceUri?: string } | undefined)?.resourceUri,
+    MINI_CANVAS_WIDGET_URI,
+  );
+  assert.equal(
+    (reopenTool?._meta?.ui as { resourceUri?: string } | undefined)?.resourceUri,
+    MINI_CANVAS_WIDGET_URI,
+  );
+  assert.match(reopenTool?.description ?? "", /draftId/u);
+  assert.equal(commitTool?.annotations?.destructiveHint, true);
+  assert.equal(commitTool?.annotations?.idempotentHint, true);
+  assert.deepEqual(commitTool?.inputSchema.required?.sort(), [
+    "confirmationToken",
+    "draftId",
+    "expectedVersion",
+    "idempotencyKey",
+  ]);
+
+  const prompts = await client.listPrompts();
+  assert.deepEqual(
+    prompts.prompts.map((prompt) => prompt.name).sort(),
+    [
+      "mini_canvas_commands",
+      "mini_canvas_create_note",
+      "mini_canvas_edit_note",
+    ],
+  );
+  const commandPrompt = await client.getPrompt({
+    name: "mini_canvas_commands",
+    arguments: {},
+  });
+  const commandPromptText = commandPrompt.messages[0]?.content;
+  assert.equal(commandPromptText?.type, "text");
+  if (commandPromptText?.type === "text") {
+    assert.match(commandPromptText.text, /MC 继续/u);
+    assert.match(commandPromptText.text, /list_drafts/u);
+    assert.match(commandPromptText.text, /MC 提交/u);
+    assert.match(commandPromptText.text, /preview_commit/u);
+  }
+  const editPrompt = await client.getPrompt({
+    name: "mini_canvas_edit_note",
+    arguments: {
+      path: "Notes/Test.md",
+      request: "Add a short summary.",
+    },
+  });
+  const editPromptText = editPrompt.messages[0]?.content;
+  assert.equal(editPromptText?.type, "text");
+  if (editPromptText?.type === "text") {
+    assert.match(editPromptText.text, /edit_note_in_mini_canvas/u);
+    assert.match(editPromptText.text, /text-only host/u);
+    assert.match(editPromptText.text, /Do not call commit_draft/u);
+  }
 
   const resources = await client.listResources();
-  assert.equal(resources.resources.length, 1);
-  assert.equal(resources.resources[0]?.uri, MINI_CANVAS_WIDGET_URI);
-  assert.equal(resources.resources[0]?.mimeType, "text/html;profile=mcp-app");
+  assert.equal(resources.resources.length, 11);
+  const currentResource = resources.resources.find(
+    (resource) => resource.uri === MINI_CANVAS_WIDGET_URI,
+  );
+  assert.equal(currentResource?.mimeType, "text/html;profile=mcp-app");
   const widget = await client.readResource({ uri: MINI_CANVAS_WIDGET_URI });
   const widgetContent = widget.contents[0];
   assert.equal(widgetContent && "text" in widgetContent, true);
@@ -343,8 +636,35 @@ test("MCP exposes the Widget resource, annotated tools and encrypted draft launc
   }
   assert.equal(widgetContent.mimeType, "text/html;profile=mcp-app");
   assert.match(widgetContent.text, /id="mini-canvas-root"/u);
-  assert.match(widgetContent.text, /<script type="module">/u);
+  assert.match(widgetContent.text, /new DecompressionStream\("gzip"\)/u);
+  assert.match(widgetContent.text, /@font-face/u);
+  assert.match(widgetContent.text, /data:font\/woff2;base64,/u);
+  assert.doesNotMatch(widgetContent.text, /format\("woff"\)/u);
+  assert.doesNotMatch(widgetContent.text, /format\("truetype"\)/u);
+  assert.ok(
+    Buffer.byteLength(widgetContent.text, "utf8") < 1_050_000,
+    "Widget template should remain below 1 MiB while retaining KaTeX fonts",
+  );
+  const compressedScript = widgetContent.text.match(
+    /const encoded="([A-Za-z0-9+/=]+)"/u,
+  )?.[1];
+  assert.ok(compressedScript, "Widget template should contain its gzip payload");
+  const decompressedScript = gunzipSync(
+    Buffer.from(compressedScript, "base64"),
+  ).toString("utf8");
+  assert.match(decompressedScript, /mini-canvas-root/u);
+  assert.match(decompressedScript, /createRoot/u);
+  assert.doesNotMatch(widgetContent.text, /process\.env\.NODE_ENV/u);
   assert.doesNotMatch(widgetContent.text, /MINI_CANVAS_MCP_AUTH_JSON/u);
+
+  const legacyWidget = await client.readResource({
+    uri: "ui://mini-canvas/editor-v4.html",
+  });
+  assert.equal(legacyWidget.contents[0]?.uri, "ui://mini-canvas/editor-v4.html");
+  assert.equal(
+    legacyWidget.contents[0]?.mimeType,
+    "text/html;profile=mcp-app",
+  );
 
   const pickerResult = await client.callTool({
     name: "open_mini_canvas",
@@ -362,6 +682,16 @@ test("MCP exposes the Widget resource, annotated tools and encrypted draft launc
   const launchedDraftId = (launchResult.structuredContent as { draftId?: string })
     .draftId;
   assert.equal(typeof launchedDraftId, "string");
+  assert.equal(
+    ((launchResult._meta as { draft?: { content?: string } } | undefined)?.draft)
+      ?.content,
+    "# MCP",
+  );
+  assert.equal(
+    ((launchResult._meta as { draft?: { isNew?: boolean } } | undefined)?.draft)
+      ?.isNew,
+    false,
+  );
   const launchedDraft = await client.callTool({
     name: "get_draft",
     arguments: { draftId: launchedDraftId },
@@ -377,6 +707,101 @@ test("MCP exposes the Widget resource, annotated tools and encrypted draft launc
   });
   assert.equal(result.isError, undefined);
   assert.equal((result.structuredContent as { path: string }).path, "Notes/Test.md");
+
+  const dedicatedNewLaunch = await client.callTool({
+    name: "create_note_in_mini_canvas",
+    arguments: {
+      path: "Notes/Dedicated create.md",
+      content: "# Created through the dedicated tool",
+    },
+  });
+  assert.equal(dedicatedNewLaunch.isError, undefined);
+  assert.equal(
+    (dedicatedNewLaunch.structuredContent as { isNew?: boolean }).isNew,
+    true,
+  );
+  assert.equal(
+    ((dedicatedNewLaunch._meta as { draft?: { content?: string } } | undefined)
+      ?.draft)?.content,
+    "# Created through the dedicated tool",
+  );
+  const dedicatedDraftId = (
+    dedicatedNewLaunch.structuredContent as { draftId?: string }
+  ).draftId;
+  assert.equal(typeof dedicatedDraftId, "string");
+
+  const listedDrafts = await client.callTool({
+    name: "list_drafts",
+    arguments: {
+      path: "Notes/Dedicated create.md",
+      status: "active",
+    },
+  });
+  assert.equal(
+    (listedDrafts.structuredContent as { count?: number }).count,
+    1,
+  );
+  assert.equal(
+    (
+      listedDrafts.structuredContent as {
+        drafts?: Array<{ id?: string; path?: string; content?: string }>;
+      }
+    ).drafts?.[0]?.id,
+    dedicatedDraftId,
+  );
+  assert.equal(
+    "content" in
+      ((listedDrafts.structuredContent as { drafts: Array<object> }).drafts[0] ??
+        {}),
+    false,
+  );
+
+  const reopenedDraft = await client.callTool({
+    name: "open_draft_in_mini_canvas",
+    arguments: { draftId: dedicatedDraftId },
+  });
+  assert.equal(
+    (reopenedDraft.structuredContent as { draftId?: string }).draftId,
+    dedicatedDraftId,
+  );
+  assert.equal(
+    ((reopenedDraft._meta as { draft?: { content?: string } } | undefined)?.draft)
+      ?.content,
+    "# Created through the dedicated tool",
+  );
+
+  const resumedByPath = await client.callTool({
+    name: "open_mini_canvas",
+    arguments: { path: "Notes/Dedicated create.md" },
+  });
+  assert.equal(resumedByPath.isError, undefined);
+  assert.equal(
+    (resumedByPath.structuredContent as { draftId?: string }).draftId,
+    dedicatedDraftId,
+  );
+  assert.equal(
+    (resumedByPath.structuredContent as { resumed?: boolean }).resumed,
+    true,
+  );
+
+  const editedLaunch = await client.callTool({
+    name: "edit_note_in_mini_canvas",
+    arguments: {
+      path: "Notes/Test.md",
+      content: "# MCP revised in one step",
+    },
+  });
+  assert.equal(editedLaunch.isError, undefined);
+  assert.equal(
+    (editedLaunch.structuredContent as { isNew?: boolean }).isNew,
+    false,
+  );
+  assert.equal(
+    ((editedLaunch._meta as { draft?: { content?: string } } | undefined)?.draft)
+      ?.content,
+    "# MCP revised in one step",
+  );
+  assert.equal((await gateway.readNote("Notes/Test.md")).content, "# MCP");
   await client.close();
   await server.close();
   database.close();
