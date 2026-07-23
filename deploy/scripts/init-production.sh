@@ -82,7 +82,8 @@ EOF
 
 cat > "$secrets_dir/mcp-server.env" <<EOF
 MINI_CANVAS_MCP_MASTER_KEY_BASE64=$mcp_master_key
-MINI_CANVAS_MCP_AUTH_JSON=[{"token":"$mcp_token","userId":"server-user","scopes":["notes:read","vault:list","attachments:read","drafts:write","drafts:commit","search:read","search:refresh"],"allowedPaths":[""]}]
+MINI_CANVAS_DEFAULT_TENANT_ID=local-vault
+MINI_CANVAS_MCP_AUTH_JSON=[{"token":"$mcp_token","userId":"server-user","tenantId":"local-vault","scopes":["notes:read","vault:list","attachments:read","drafts:write","drafts:commit","search:read","search:refresh"],"allowedPaths":[""]}]
 MINI_CANVAS_MCP_AUTO_INDEX=true
 MINI_CANVAS_VAULT_CASE_INSENSITIVE=true
 MINI_CANVAS_MCP_DRAFT_RETENTION_DAYS=30

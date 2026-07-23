@@ -48,6 +48,7 @@ $mcpToken = New-RandomBase64 32
 $identityRecord = @{
   token = $mcpToken
   userId = "local-user"
+  tenantId = "local-vault"
   scopes = @(
     "notes:read",
     "vault:list",
@@ -64,6 +65,7 @@ $identity = ConvertTo-Json -InputObject @($identityRecord) -Compress -Depth 5
 $lines = @(
   "MINI_CANVAS_MCP_PORT=3220",
   "MINI_CANVAS_MCP_DB=.local/mcp-server.sqlite",
+  "MINI_CANVAS_DEFAULT_TENANT_ID=local-vault",
   "MINI_CANVAS_MCP_MASTER_KEY_BASE64=$masterKey",
   "MINI_CANVAS_MCP_AUTH_JSON=$identity",
   "MINI_CANVAS_BRIDGE_URL=http://127.0.0.1:3210",

@@ -15,7 +15,9 @@ import type {
 
 type DraftRow = {
   id: string;
+  tenant_id: string;
   user_id: string;
+  crypto_version: 1 | 2;
   path_nonce: string;
   path_ciphertext: string;
   path_tag: string;
@@ -94,20 +96,31 @@ export class DraftRepository {
     this.crypto = crypto;
   }
 
-  private aad(userId: string, id: string, field: string): string {
-    return `draft\0${userId}\0${id}\0${field}`;
+  private aad(
+    tenantId: string,
+    userId: string,
+    id: string,
+    field: string,
+    cryptoVersion = 2,
+  ): string {
+    return cryptoVersion === 1
+      ? `draft\0${userId}\0${id}\0${field}`
+      : `draft\0${tenantId}\0${userId}\0${id}\0${field}`;
   }
 
-  private getRow(id: string, userId: string): DraftRow {
+  private getRow(id: string, tenantId: string, userId: string): DraftRow {
     const row = this.db.connection
-      .prepare("SELECT * FROM drafts WHERE id = ? AND user_id = ?")
-      .get(id, userId) as DraftRow | undefined;
+      .prepare("SELECT * FROM drafts WHERE id = ? AND tenant_id = ? AND user_id = ?")
+      .get(id, tenantId, userId) as DraftRow | undefined;
     if (!row) throw new DraftNotFoundError();
     if (row.status === "active" && row.expires_at <= Date.now()) {
       const expiredAt = Date.now();
       this.db.connection
-        .prepare("UPDATE drafts SET status = 'expired', updated_at = ? WHERE id = ?")
-        .run(expiredAt, id);
+        .prepare(`
+          UPDATE drafts SET status = 'expired', updated_at = ?
+          WHERE id = ? AND tenant_id = ? AND user_id = ?
+        `)
+        .run(expiredAt, id, tenantId, userId);
       row.status = "expired";
       row.updated_at = expiredAt;
     }
@@ -117,15 +130,15 @@ export class DraftRepository {
   private decode(row: DraftRow): DraftWithBase {
     const path = this.crypto.decryptDraft(
       encryptedFromRow(row as unknown as Record<string, unknown>, "path"),
-      this.aad(row.user_id, row.id, "path"),
+      this.aad(row.tenant_id, row.user_id, row.id, "path", row.crypto_version),
     );
     const content = this.crypto.decryptDraft(
       encryptedFromRow(row as unknown as Record<string, unknown>, "current"),
-      this.aad(row.user_id, row.id, "current"),
+      this.aad(row.tenant_id, row.user_id, row.id, "current", row.crypto_version),
     );
     const baseContent = this.crypto.decryptDraft(
       encryptedFromRow(row as unknown as Record<string, unknown>, "base"),
-      this.aad(row.user_id, row.id, "base"),
+      this.aad(row.tenant_id, row.user_id, row.id, "base", row.crypto_version),
     );
     return {
       id: row.id,
@@ -149,7 +162,7 @@ export class DraftRepository {
   private decodeSummary(row: DraftRow): DraftSummary {
     const path = this.crypto.decryptDraft(
       encryptedFromRow(row as unknown as Record<string, unknown>, "path"),
-      this.aad(row.user_id, row.id, "path"),
+      this.aad(row.tenant_id, row.user_id, row.id, "path", row.crypto_version),
     );
     return {
       id: row.id,
@@ -168,6 +181,7 @@ export class DraftRepository {
   }
 
   list(
+    tenantId: string,
     userId: string,
     options: {
       status?: DraftStatus;
@@ -184,20 +198,20 @@ export class DraftRepository {
     this.db.connection.prepare(`
       UPDATE drafts
       SET status = 'expired', updated_at = ?
-      WHERE user_id = ? AND status = 'active' AND expires_at <= ?
-    `).run(now, userId, now);
+      WHERE tenant_id = ? AND user_id = ? AND status = 'active' AND expires_at <= ?
+    `).run(now, tenantId, userId, now);
 
     const rows = (options.status
       ? this.db.connection.prepare(`
           SELECT * FROM drafts
-          WHERE user_id = ? AND status = ?
+          WHERE tenant_id = ? AND user_id = ? AND status = ?
           ORDER BY updated_at DESC, created_at DESC, id DESC
-        `).all(userId, options.status)
+        `).all(tenantId, userId, options.status)
       : this.db.connection.prepare(`
           SELECT * FROM drafts
-          WHERE user_id = ?
+          WHERE tenant_id = ? AND user_id = ?
           ORDER BY updated_at DESC, created_at DESC, id DESC
-        `).all(userId)) as unknown as DraftRow[];
+        `).all(tenantId, userId)) as unknown as DraftRow[];
 
     const summaries: DraftSummary[] = [];
     for (const row of rows) {
@@ -235,6 +249,7 @@ export class DraftRepository {
   }
 
   create(input: {
+    tenantId: string;
     userId: string;
     path: string;
     content: string;
@@ -251,25 +266,27 @@ export class DraftRepository {
     const expiresAt = now + Math.round(expiresInHours * 60 * 60 * 1000);
     const path = this.crypto.encryptDraft(
       input.path,
-      this.aad(input.userId, id, "path"),
+      this.aad(input.tenantId, input.userId, id, "path"),
     );
     const base = this.crypto.encryptDraft(
       input.baseContent ?? input.content,
-      this.aad(input.userId, id, "base"),
+      this.aad(input.tenantId, input.userId, id, "base"),
     );
     const current = this.crypto.encryptDraft(
       input.content,
-      this.aad(input.userId, id, "current"),
+      this.aad(input.tenantId, input.userId, id, "current"),
     );
     this.db.connection.prepare(`
       INSERT INTO drafts (
-        id, user_id, path_nonce, path_ciphertext, path_tag, base_revision,
+        id, tenant_id, user_id, crypto_version,
+        path_nonce, path_ciphertext, path_tag, base_revision,
         version, status, base_nonce, base_ciphertext, base_tag,
         current_nonce, current_ciphertext, current_tag,
         created_at, updated_at, expires_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 1, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, 2, ?, ?, ?, ?, 1, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
+      input.tenantId,
       input.userId,
       path.nonce,
       path.ciphertext,
@@ -286,68 +303,74 @@ export class DraftRepository {
       expiresAt,
     );
     const { baseContent, ...snapshot } = this.decode(
-      this.getRow(id, input.userId),
+      this.getRow(id, input.tenantId, input.userId),
     );
     void baseContent;
     return snapshot;
   }
 
-  get(id: string, userId: string): DraftSnapshot {
-    const { baseContent, ...snapshot } = this.decode(this.getRow(id, userId));
+  get(id: string, tenantId: string, userId: string): DraftSnapshot {
+    const { baseContent, ...snapshot } = this.decode(
+      this.getRow(id, tenantId, userId),
+    );
     void baseContent;
     return snapshot;
   }
 
-  getWithBase(id: string, userId: string): DraftWithBase {
-    return this.decode(this.getRow(id, userId));
+  getWithBase(id: string, tenantId: string, userId: string): DraftWithBase {
+    return this.decode(this.getRow(id, tenantId, userId));
   }
 
   update(input: {
     id: string;
+    tenantId: string;
     userId: string;
     content: string;
     expectedVersion: number;
   }): DraftSnapshot {
-    const row = this.getRow(input.id, input.userId);
+    const row = this.getRow(input.id, input.tenantId, input.userId);
     if (row.status !== "active") throw new DraftStateError(row.status);
     if (row.version !== input.expectedVersion) {
       throw new DraftConflictError(input.expectedVersion, row.version);
     }
     const encrypted = this.crypto.encryptDraft(
       input.content,
-      this.aad(input.userId, input.id, "current"),
+      this.aad(input.tenantId, input.userId, input.id, "current"),
     );
     const now = Date.now();
     const result = this.db.connection.prepare(`
       UPDATE drafts
       SET current_nonce = ?, current_ciphertext = ?, current_tag = ?,
           version = version + 1, updated_at = ?
-      WHERE id = ? AND user_id = ? AND version = ? AND status = 'active'
+      WHERE id = ? AND tenant_id = ? AND user_id = ?
+        AND version = ? AND status = 'active'
     `).run(
       encrypted.nonce,
       encrypted.ciphertext,
       encrypted.tag,
       now,
       input.id,
+      input.tenantId,
       input.userId,
       input.expectedVersion,
     );
     if (changes(result) !== 1) {
-      const latest = this.getRow(input.id, input.userId);
+      const latest = this.getRow(input.id, input.tenantId, input.userId);
       throw new DraftConflictError(input.expectedVersion, latest.version);
     }
-    return this.get(input.id, input.userId);
+    return this.get(input.id, input.tenantId, input.userId);
   }
 
   markCommitted(input: {
     id: string;
+    tenantId: string;
     userId: string;
     expectedVersion: number;
     revision: string;
   }): DraftSnapshot {
-    const row = this.getRow(input.id, input.userId);
+    const row = this.getRow(input.id, input.tenantId, input.userId);
     if (row.status === "committed" && row.committed_revision === input.revision) {
-      return this.get(input.id, input.userId);
+      return this.get(input.id, input.tenantId, input.userId);
     }
     if (row.status !== "active") throw new DraftStateError(row.status);
     if (row.version !== input.expectedVersion) {
@@ -356,12 +379,20 @@ export class DraftRepository {
     const result = this.db.connection.prepare(`
       UPDATE drafts
       SET status = 'committed', committed_revision = ?, updated_at = ?
-      WHERE id = ? AND user_id = ? AND version = ? AND status = 'active'
-    `).run(input.revision, Date.now(), input.id, input.userId, input.expectedVersion);
+      WHERE id = ? AND tenant_id = ? AND user_id = ?
+        AND version = ? AND status = 'active'
+    `).run(
+      input.revision,
+      Date.now(),
+      input.id,
+      input.tenantId,
+      input.userId,
+      input.expectedVersion,
+    );
     if (changes(result) !== 1) {
-      const latest = this.getRow(input.id, input.userId);
+      const latest = this.getRow(input.id, input.tenantId, input.userId);
       throw new DraftConflictError(input.expectedVersion, latest.version);
     }
-    return this.get(input.id, input.userId);
+    return this.get(input.id, input.tenantId, input.userId);
   }
 }

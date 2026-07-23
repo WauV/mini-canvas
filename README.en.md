@@ -169,36 +169,51 @@ Wiki Links and Embeds use an asynchronous MCP resolution layer. Short links firs
 
 ## Architecture
 
-```text
-ChatGPT / Claude MCP Apps · Claude Code / Gemini CLI
-                         │
-                         ▼
-       Tunnel / HTTPS Bearer / future OAuth gateway
-                         │
-                         ▼
-             TypeScript MCP Server
- auth · paths · encrypted drafts · preview · commit · search
-                         │
-                         ▼
-             TypeScript LiveSync Bridge
- crypto · chunks · attachments · revisions · idempotency
-                         │
-                         ▼
-                  CouchDB ciphertext
-                         │
-                         ▼
-          Obsidian Self-hosted LiveSync
+```mermaid
+flowchart TD
+    H["ChatGPT / Claude MCP Apps<br/>Gemini CLI / Claude Code / local development page"]
+    C["Connection layer<br/>Secure MCP Tunnel · local HTTP · public HTTPS"]
+
+    subgraph MCP["Node.js / TypeScript MCP Server"]
+        A["Authentication boundary<br/>Static Bearer: current<br/>OAuth 2.1 / Auth0: next"]
+        P["Principal<br/>tenantId · userId · scopes · allowedPaths"]
+        O["Business orchestration and MCP tools<br/>list · read · draft · preview · commit · search"]
+        R["TenantResourceProvider<br/>resolve Vault resources by tenantId"]
+        D["Encrypted draft repository<br/>tenantId + userId"]
+        S["Tenant search coordinator<br/>index · checkpoint · change listener"]
+        Q[("SQLite v2<br/>encrypted drafts · tenant-partitioned search")]
+
+        A --> P --> O
+        O --> D --> Q
+        O --> R --> S --> Q
+    end
+
+    subgraph DEFAULT["Currently registered tenant: local-vault"]
+        G["NoteGateway"]
+        B["TypeScript LiveSync Bridge<br/>crypto · chunks · attachments · revisions · idempotency"]
+    end
+
+    V[("CouchDB ciphertext")]
+    OBS["Obsidian<br/>Self-hosted LiveSync"]
+
+    H --> C --> A
+    R --> G --> B --> V
+    OBS <--> V
 ```
 
 Component boundaries:
 
-- **Editor / Widget** — editing, preview, and MCP tool calls; never receives CouchDB credentials or LiveSync keys.
-- **MCP Server** — user identity, scopes, allowed paths, encrypted drafts, search coordination, commit confirmation, tools, Prompts, and UI resources.
-- **LiveSync Bridge** — LiveSync-compatible encryption, metadata, chunks, attachments, revisions, and idempotent writes.
+- **Editor / Widget** — editing, Live Preview, LaTeX/SVG rendering, and MCP tool calls; never receives CouchDB credentials, LiveSync keys, or the server-side Bearer token.
+- **Authentication and authorization** — the current static token resolves to `tenantId + userId + scopes + allowedPaths`. Auth0 will replace the verifier without changing business or storage boundaries.
+- **Business orchestration** — Vault listing and reads, draft state, commit confirmation, search, MCP tools, Prompts, and Widget resources.
+- **TenantResourceProvider** — selects the Gateway and search coordinator by `tenantId`. Only `local-vault` is registered today; unknown tenants are rejected before the Bridge is called.
+- **SQLite v2** — drafts are isolated by `tenantId + userId`; search documents, HMAC terms, generations, and change checkpoints are tenant-partitioned.
+- **LiveSync Bridge** — LiveSync-compatible encryption, metadata, chunks, attachments, revisions, conflicts, and idempotent writes; it does not authenticate end users.
 - **CouchDB** — encrypted synchronization source of truth.
-- **SQLite** — encrypted drafts and a rebuildable encrypted search index.
 
 The MCP server never talks directly to CouchDB. The Widget never talks directly to the Bridge.
+
+The current deployment is **single-Vault with a completed multi-tenant isolation skeleton**. `local-vault` maps to the existing isolated Bridge and test CouchDB. In the next Auth0 phase, Auth0 `sub` will map to `userId`, a Mini Canvas account or workspace will map to `tenantId`, and each tenant will receive its own Vault connection. The current implementation neither points multiple tenants at the owner's personal Vault nor stores per-user LiveSync credentials.
 
 ## Repository layout
 
@@ -392,7 +407,11 @@ unset MINI_CANVAS_TOKEN
 
 Gemini still requires Folder Trust for each relevant project directory. Do not enable global `--trust` merely to remove confirmation prompts.
 
-The public endpoint currently uses a static Bearer token and is intended for personal CLI clients. Claude.ai, Gemini web Connected Apps, and ordinary remote ChatGPT connectors may require standards-compliant OAuth discovery and authorization. OpenAI Secure MCP Tunnel is a separate dedicated connection path. For multi-user web publication, place an OAuth authorization gateway in front of the MCP server and map validated identities to the existing `Principal` model.
+The public endpoint currently uses a static Bearer token and is intended for personal CLI clients. Claude.ai, Gemini web Connected Apps, and ordinary remote ChatGPT connectors may require standards-compliant OAuth discovery and authorization. OpenAI Secure MCP Tunnel is a separate dedicated connection path. The next multi-user phase will use Auth0 as the OAuth 2.1 authorization server; the MCP server will publish protected-resource metadata, verify access tokens, and map claims to the existing tenant-aware `Principal` without rewriting draft, search, or Bridge business logic.
+
+The current single-Vault deployment binds its Bridge and search coordinator to `MINI_CANVAS_DEFAULT_TENANT_ID=local-vault`. Every authenticated identity resolves to `tenantId + userId + scopes + allowedPaths`; drafts, search documents, term hashes, and change checkpoints are partitioned by tenant. Static token records that omit `tenantId` inherit the default, so existing Tunnel deployments remain compatible. An unregistered tenant is rejected before any Bridge request is made.
+
+SQLite v2 preserves legacy encrypted drafts under the default tenant with v1 ciphertext compatibility. The search index is derived data, so migration clears and rebuilds it instead of carrying a global checkpoint into a tenant partition. A future Auth0 integration can map `sub` to `userId` and the application account or workspace to `tenantId`; OAuth and per-tenant LiveSync credential storage are intentionally not implemented yet.
 
 ### 6. Backup and upgrade
 
@@ -516,6 +535,7 @@ To reopen an uncommitted draft, call `open_draft_in_mini_canvas({ draftId })`. I
 
 Static test/server tokens map to:
 
+- `tenantId`
 - `userId`
 - scopes
 - allowed Vault path prefixes

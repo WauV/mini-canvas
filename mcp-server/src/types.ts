@@ -12,6 +12,7 @@ export type McpScope = (typeof MCP_SCOPES)[number];
 
 export type Principal = {
   userId: string;
+  tenantId: string;
   scopes: McpScope[];
   allowedPaths: string[];
 };

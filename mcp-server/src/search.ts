@@ -12,6 +12,7 @@ import { BridgeHttpError, type NoteGateway } from "./bridge-client.ts";
 import type { SearchCandidate, SearchHealth } from "./types.ts";
 
 type SearchDocumentRow = {
+  tenant_id: string;
   id: string;
   path_nonce: string;
   path_ciphertext: string;
@@ -64,51 +65,63 @@ function noteTitle(path: string): string {
 export class SearchIndex {
   private readonly db: McpDatabase;
   private readonly crypto: AtRestCrypto;
+  readonly tenantId: string;
 
-  constructor(db: McpDatabase, crypto: AtRestCrypto) {
+  constructor(db: McpDatabase, crypto: AtRestCrypto, tenantId = "local-vault") {
     this.db = db;
     this.crypto = crypto;
+    this.tenantId = tenantId;
   }
 
   private aad(id: string, field: string): string {
-    return `search\0${id}\0${field}`;
+    return `search\0${this.tenantId}\0${id}\0${field}`;
   }
 
   clear(): void {
     this.db.transaction(() => {
-      this.db.connection.exec("DELETE FROM search_documents");
       this.db.connection
-        .prepare("DELETE FROM service_state WHERE key = 'search_sequence'")
-        .run();
+        .prepare("DELETE FROM search_documents WHERE tenant_id = ?")
+        .run(this.tenantId);
+      this.db.connection
+        .prepare(`
+          DELETE FROM service_state
+          WHERE tenant_id = ? AND key = 'search_sequence'
+        `)
+        .run(this.tenantId);
     });
   }
 
   revisionForPath(path: string): string | undefined {
     const row = this.db.connection
-      .prepare("SELECT revision FROM search_documents WHERE id = ?")
-      .get(this.crypto.documentId(path)) as { revision: string } | undefined;
+      .prepare("SELECT revision FROM search_documents WHERE tenant_id = ? AND id = ?")
+      .get(this.tenantId, this.crypto.documentId(this.tenantId, path)) as
+        | { revision: string }
+        | undefined;
     return row?.revision;
   }
 
   touchGeneration(path: string, generation: string): void {
     this.db.connection
-      .prepare("UPDATE search_documents SET generation = ? WHERE id = ?")
-      .run(generation, this.crypto.documentId(path));
+      .prepare(`
+        UPDATE search_documents SET generation = ?
+        WHERE tenant_id = ? AND id = ?
+      `)
+      .run(generation, this.tenantId, this.crypto.documentId(this.tenantId, path));
   }
 
   upsert(entry: VaultEntrySummary, content: string, generation: string): void {
-    const id = this.crypto.documentId(entry.path);
+    const id = this.crypto.documentId(this.tenantId, entry.path);
     const path = this.crypto.encryptSearch(entry.path, this.aad(id, "path"));
     const title = this.crypto.encryptSearch(noteTitle(entry.path), this.aad(id, "title"));
     const terms = tokenizeSearchText(`${noteTitle(entry.path)}\n${content}`);
     this.db.transaction(() => {
       this.db.connection.prepare(`
         INSERT INTO search_documents (
-          id, path_nonce, path_ciphertext, path_tag,
+          tenant_id, id, path_nonce, path_ciphertext, path_tag,
           title_nonce, title_ciphertext, title_tag,
           revision, mtime, size, generation
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(tenant_id, id) DO UPDATE SET
           path_nonce = excluded.path_nonce,
           path_ciphertext = excluded.path_ciphertext,
           path_tag = excluded.path_tag,
@@ -120,6 +133,7 @@ export class SearchIndex {
           size = excluded.size,
           generation = excluded.generation
       `).run(
+        this.tenantId,
         id,
         path.nonce,
         path.ciphertext,
@@ -133,13 +147,19 @@ export class SearchIndex {
         generation,
       );
       this.db.connection
-        .prepare("DELETE FROM search_terms WHERE document_id = ?")
-        .run(id);
+        .prepare("DELETE FROM search_terms WHERE tenant_id = ? AND document_id = ?")
+        .run(this.tenantId, id);
       const insert = this.db.connection.prepare(
-        "INSERT INTO search_terms(document_id, term_hash, frequency) VALUES (?, ?, ?)",
+        `INSERT INTO search_terms(tenant_id, document_id, term_hash, frequency)
+         VALUES (?, ?, ?, ?)`,
       );
       for (const [term, frequency] of terms) {
-        insert.run(id, this.crypto.searchTerm(term), frequency);
+        insert.run(
+          this.tenantId,
+          id,
+          this.crypto.searchTerm(this.tenantId, term),
+          frequency,
+        );
       }
     });
   }
@@ -162,29 +182,33 @@ export class SearchIndex {
 
   removePath(path: string): void {
     this.db.connection
-      .prepare("DELETE FROM search_documents WHERE id = ?")
-      .run(this.crypto.documentId(path));
+      .prepare("DELETE FROM search_documents WHERE tenant_id = ? AND id = ?")
+      .run(this.tenantId, this.crypto.documentId(this.tenantId, path));
   }
 
   sweepGeneration(generation: string): void {
     this.db.connection
-      .prepare("DELETE FROM search_documents WHERE generation <> ?")
-      .run(generation);
+      .prepare("DELETE FROM search_documents WHERE tenant_id = ? AND generation <> ?")
+      .run(this.tenantId, generation);
   }
 
   getSequence(): string | undefined {
     const row = this.db.connection
-      .prepare("SELECT value FROM service_state WHERE key = 'search_sequence'")
-      .get() as { value: string } | undefined;
+      .prepare(`
+        SELECT value FROM service_state
+        WHERE tenant_id = ? AND key = 'search_sequence'
+      `)
+      .get(this.tenantId) as { value: string } | undefined;
     return row?.value;
   }
 
   setSequence(sequence: string): void {
     this.db.connection.prepare(`
-      INSERT INTO service_state(key, value, updated_at)
-      VALUES ('search_sequence', ?, ?)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-    `).run(sequence, Date.now());
+      INSERT INTO service_state(tenant_id, key, value, updated_at)
+      VALUES (?, 'search_sequence', ?, ?)
+      ON CONFLICT(tenant_id, key) DO UPDATE SET
+        value = excluded.value, updated_at = excluded.updated_at
+    `).run(this.tenantId, sequence, Date.now());
   }
 
   private decode(row: SearchDocumentRow): SearchCandidate {
@@ -207,25 +231,35 @@ export class SearchIndex {
 
   getById(id: string): SearchCandidate | undefined {
     const row = this.db.connection
-      .prepare("SELECT *, 0 AS score FROM search_documents WHERE id = ?")
-      .get(id) as SearchDocumentRow | undefined;
+      .prepare(`
+        SELECT *, 0 AS score FROM search_documents
+        WHERE tenant_id = ? AND id = ?
+      `)
+      .get(this.tenantId, id) as SearchDocumentRow | undefined;
     return row ? this.decode(row) : undefined;
   }
 
   search(query: string, limit = 20): SearchCandidate[] {
     const terms = [...tokenizeSearchText(query).keys()];
     if (terms.length === 0) return [];
-    const hashes = [...new Set(terms.map((term) => this.crypto.searchTerm(term)))];
+    const hashes = [
+      ...new Set(terms.map((term) => this.crypto.searchTerm(this.tenantId, term))),
+    ];
     const placeholders = hashes.map(() => "?").join(", ");
     const rows = this.db.connection.prepare(`
       SELECT d.*, COUNT(DISTINCT t.term_hash) * 1000 + SUM(t.frequency) AS score
       FROM search_terms t
-      JOIN search_documents d ON d.id = t.document_id
-      WHERE t.term_hash IN (${placeholders})
+      JOIN search_documents d
+        ON d.tenant_id = t.tenant_id AND d.id = t.document_id
+      WHERE t.tenant_id = ? AND t.term_hash IN (${placeholders})
       GROUP BY d.id
       ORDER BY COUNT(DISTINCT t.term_hash) DESC, SUM(t.frequency) DESC, d.mtime DESC
       LIMIT ?
-    `).all(...hashes, Math.max(1, Math.min(limit, 100))) as SearchDocumentRow[];
+    `).all(
+      this.tenantId,
+      ...hashes,
+      Math.max(1, Math.min(limit, 100)),
+    ) as SearchDocumentRow[];
     return rows.map((row) => this.decode(row));
   }
 }

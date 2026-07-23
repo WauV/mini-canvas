@@ -345,6 +345,10 @@ Bridge、MCP Server 和 CouchDB 已经可以作为一套隔离容器运行。容
 
 MCP Bearer Token 至少为 32 个字符，并通过固定长度摘要进行恒时比较；连续认证失败会受到短时限制。`MINI_CANVAS_MCP_AUTH_JSON` 中的身份记录可增加 `expiresAt`（Unix 秒）以安排轮换。过期草稿默认继续加密保留 30 天，MCP Server 启动时以及每 6 小时自动清理；可通过 `MINI_CANVAS_MCP_DRAFT_RETENTION_DAYS` 调整为 1–365 天。
 
+当前单 Vault 容器默认绑定到 `MINI_CANVAS_DEFAULT_TENANT_ID=local-vault`。每个服务端身份都会解析为 `tenantId + userId + scopes + allowedPaths`；草稿、搜索文档、词元和变更 checkpoint 均以租户分区。静态 Token 记录未填 `tenantId` 时会自动使用默认租户，因此现有 Tunnel 与单 Vault 配置不需改动。未注册的租户会在访问 Bridge 前被拒绝。
+
+SQLite v2 迁移会把旧草稿归入默认租户并保留 v1 密文兼容；搜索索引是可重建的派生数据，升级时会清空后从隔离 Vault 重建。未来 Auth0 的 `sub` 可映射为 `userId`，账户或工作区映射为 `tenantId`；本轮尚未实现 OAuth 或每租户 LiveSync 凭据存储。
+
 首次启动前仍需准备三个被 Git 忽略的文件：
 
 - `.local/couchdb.env`
@@ -512,7 +516,7 @@ unset MINI_CANVAS_TOKEN
 
 Gemini 第一次使用相应工作目录时仍会要求 Folder Trust；不要为了省去确认而启用全局 `--trust`。Claude Code 与 Gemini CLI 使用工具和标准 MCP Prompt。支持 MCP Apps 的 Claude 宿主还可以渲染 v10 Widget。
 
-当前公网入口使用静态 Bearer Token，适合个人 CLI 客户端。Claude.ai、Gemini 网页 Connected Apps 和普通 ChatGPT 远程 Connector 可能要求标准 OAuth 动态注册/授权；OpenAI Secure MCP Tunnel 也属于另一条专用接入链路。因此，不要把这个 Bearer 入口描述成已经完成网页端 OAuth 发布。需要网页端多用户接入时，应在 Caddy 与 MCP Server 之间增加标准 OAuth 授权网关，并把 Token 映射为现有 `Principal`，业务层无需重写。
+当前公网入口使用静态 Bearer Token，适合个人 CLI 客户端。Claude.ai、Gemini 网页 Connected Apps 和普通 ChatGPT 远程 Connector 可能要求标准 OAuth 动态注册/授权；OpenAI Secure MCP Tunnel 也属于另一条专用接入链路。因此，不要把这个 Bearer 入口描述成已经完成网页端 OAuth 发布。需要网页端多用户接入时，下一阶段将使用 Auth0 作为 OAuth 2.1 授权服务器，由 MCP Server 发布资源元数据、验证访问令牌，并把令牌声明映射为现有租户化 `Principal`；草稿、搜索和 Bridge 业务层无需重写。
 
 ### 6. 备份、升级和停机
 
@@ -688,7 +692,7 @@ Prompt 和 Server instructions 都是宿主中立的：支持 MCP Apps 的宿主
 
 这一步只创建 SQLite 中的加密草稿，不会立即修改 Vault。用户可在 Mini Canvas 中检查和编辑，再通过提交预览确认创建。需要稍后重新打开时，宿主使用返回的 `draftId` 调用 `open_draft_in_mini_canvas`；若 ID 已丢失，则先用 `list_drafts({ path?, status: "active" })` 找回。`open_mini_canvas({ path })` 也会优先恢复该路径最近的活动草稿，包括尚未提交、因而还不存在于 Vault 的新笔记。`create_draft`、`get_draft` 和 `update_draft` 同样关联 Widget。MCP Server 的初始化 `instructions` 明确规定“读取完整原文 → 生成完整修改 → 打开可见草稿 → 用户确认后才提交”的顺序；这比依赖 ChatGPT 额外读取仓库中的 `SKILL.md` 更适合 App Connector。
 
-权限由 Bearer Token 映射为 `userId`、`scopes` 和 `allowedPaths`。路径授权在服务端执行，不信任 Widget 或客户端传来的身份提示。草稿正文、基线正文和路径使用 AES-256-GCM 加密；搜索词元使用 HMAC，搜索文档的路径与标题也加密，SQLite 不保存笔记正文。
+权限由 Bearer Token 映射为 `tenantId`、`userId`、`scopes` 和 `allowedPaths`。路径与租户授权均在服务端执行，不信任 Widget 或客户端传来的身份提示。草稿正文、基线正文和路径使用 AES-256-GCM 加密；搜索词元使用租户域分离的 HMAC，搜索文档的路径与标题也加密，SQLite 不保存笔记正文。
 
 附件策略：PNG、JPEG、WebP 和 GIF 可以作为 MCP image content 返回；SVG 和受支持的 UTF-8 文本作为文本返回；ZIP、DOCX、PDF 等其他二进制只返回元数据，不会把 Base64 内容塞进模型上下文。
 
@@ -715,40 +719,55 @@ Live Preview 已把“解析 Markdown”和“根据选区生成装饰”拆开�
 
 当前仍是全篇解析，而不是增量 block 解析，所以超长文档的连续输入仍是下一阶段最值得优化的部分。后续可以只重解析变化附近的 block，或逐步利用 CodeMirror 语法树替代更多手写扫描。
 
-## 规划中的整体架构
+## 整体架构
 
-```text
-ChatGPT / Claude MCP Apps · Gemini / Claude Code 文本宿主
-                            │
-                            ▼
-          各宿主连接层（Tunnel / HTTPS OAuth / 本机 HTTP）
-                            │
-                            ▼
-Node.js / TypeScript MCP Server
-认证 · 授权 · 草稿 · 预览 · 提交 · 搜索
-            │
-            ▼
-TypeScript LiveSync Bridge（Node.js）
-加解密 · revision · chunk · 冲突 · 幂等写入
-            │
-            ▼
-CouchDB 密文仓库
-            │
-            ▼
-Obsidian Self-hosted LiveSync
+```mermaid
+flowchart TD
+    H["ChatGPT / Claude MCP Apps<br/>Gemini CLI / Claude Code / 本地开发页"]
+    C["连接层<br/>Secure MCP Tunnel · 本机 HTTP · 公网 HTTPS"]
+
+    subgraph MCP["Node.js / TypeScript MCP Server"]
+        A["认证边界<br/>静态 Bearer：当前<br/>OAuth 2.1 / Auth0：下一阶段"]
+        P["Principal<br/>tenantId · userId · scopes · allowedPaths"]
+        O["业务协调与 MCP 工具<br/>列表 · 读取 · 草稿 · 预览 · 提交 · 搜索"]
+        R["TenantResourceProvider<br/>按 tenantId 解析 Vault 资源"]
+        D["加密草稿仓库<br/>tenantId + userId"]
+        S["租户搜索协调器<br/>索引 · checkpoint · 变更监听"]
+        Q[("SQLite v2<br/>加密草稿 · 租户化搜索索引")]
+
+        A --> P --> O
+        O --> D --> Q
+        O --> R --> S --> Q
+    end
+
+    subgraph DEFAULT["当前注册租户：local-vault"]
+        G["NoteGateway"]
+        B["TypeScript LiveSync Bridge<br/>加解密 · chunk · 附件 · revision · 幂等写入"]
+    end
+
+    V[("CouchDB 密文仓库")]
+    OBS["Obsidian<br/>Self-hosted LiveSync"]
+
+    H --> C --> A
+    R --> G --> B --> V
+    OBS <--> V
 ```
 
-计划中的职责边界：
+当前职责边界：
 
-- **前端 / Widget**：编辑、预览和发起工具调用，不直接访问 CouchDB
-- **TypeScript MCP Server（Node.js）**：用户鉴权、路径权限、草稿状态机、提交确认、搜索协调，以及注册宿主中立的 MCP 工具、Prompt 和 Widget 资源
-- **TypeScript LiveSync Bridge（Node.js）**：处理 LiveSync 数据格式、加解密、附件、逻辑版本和冲突
-- **CouchDB**：作为同步数据的事实来源
-- **SQLite**：仅保存草稿状态和可重建的搜索索引
+- **前端 / Widget**：编辑、Live Preview、LaTeX/SVG 渲染和 MCP 工具调用；不接收 CouchDB 凭据、LiveSync 口令或服务端 Bearer Token。
+- **认证与授权层**：静态 Token 当前解析为 `tenantId + userId + scopes + allowedPaths`；未来 Auth0 只替换身份验证器，不改变业务和存储边界。
+- **业务协调层**：负责列表、读取、草稿状态机、提交确认、搜索以及 MCP 工具、Prompt 和 Widget 资源。
+- **TenantResourceProvider**：依据 `tenantId` 选择对应的 Gateway 和搜索协调器；当前只注册 `local-vault`，未知租户在接触 Bridge 前即被拒绝。
+- **SQLite v2**：草稿按 `tenantId + userId` 隔离；搜索文档、HMAC 词元、generation 和变更 checkpoint 全部按租户分区。数据库不保存笔记明文索引。
+- **TypeScript LiveSync Bridge**：只处理 LiveSync 数据格式、加解密、附件、逻辑版本、冲突和幂等写入，不负责用户身份。
+- **CouchDB**：保存 LiveSync 兼容密文，是 Obsidian 同步数据的事实来源。
 
 每次正式写入都应携带预期版本和幂等键；发现冲突时明确返回，不静默覆盖。
 
-这里不再为 MCP 层单独引入 Python。前端、MCP Server 与 LiveSync Bridge 统一使用 TypeScript，可以直接共享 `DocumentSnapshot`、工具输入输出、权限规则、错误类型和校验模型，也只需要维护一套 Node.js 构建、测试与部署环境。MCP Server 与 LiveSync Bridge 仍保持为两个独立模块：前者负责面向 ChatGPT 的业务与权限边界，后者只负责 LiveSync 兼容和密文仓库读写，避免把 CouchDB 凭据暴露给 Widget。
+这里不再为 MCP 层单独引入 Python。前端、MCP Server 与 LiveSync Bridge 统一使用 TypeScript，可以直接共享工具输入输出、权限规则、错误类型和校验模型，也只需要维护一套 Node.js 构建、测试与部署环境。MCP Server 与 LiveSync Bridge 仍保持为两个独立模块：前者负责宿主工具、租户、业务与权限边界，后者只负责 LiveSync 兼容和密文仓库读写。
+
+当前仍是**单 Vault、已具备多租户隔离骨架**的部署：`local-vault` 对应现有隔离 Bridge 和测试 CouchDB。下一阶段接入 Auth0 后，Auth0 `sub` 映射为 `userId`，Mini Canvas 账户或工作区映射为 `tenantId`；再为每个租户注册独立的 Vault 连接。现阶段没有把多个租户指向同一个个人 Vault，也没有在数据库中保存用户 LiveSync 凭据。
 
 ## Claude 与 Gemini
 

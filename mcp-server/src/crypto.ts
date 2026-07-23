@@ -77,16 +77,18 @@ export class AtRestCrypto {
     return decrypt(this.searchEncryptionKey, value, aad);
   }
 
-  searchTerm(term: string): string {
-    return createHmac("sha256", this.searchHmacKey).update(term, "utf8").digest("hex");
+  searchTerm(tenantId: string, term: string): string {
+    return createHmac("sha256", this.searchHmacKey)
+      .update(`tenant\0${tenantId}\0term\0${term}`, "utf8")
+      .digest("hex");
   }
 
-  documentId(path: string): string {
+  documentId(tenantId: string, path: string): string {
     const canonicalPath = this.caseInsensitivePaths
       ? path.normalize("NFKC").toLowerCase()
       : path.normalize("NFKC");
     return createHmac("sha256", this.searchHmacKey)
-      .update(`document\0${canonicalPath}`, "utf8")
+      .update(`tenant\0${tenantId}\0document\0${canonicalPath}`, "utf8")
       .digest("hex");
   }
 }

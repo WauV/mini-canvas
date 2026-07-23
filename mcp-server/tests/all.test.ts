@@ -6,6 +6,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { gunzipSync } from "node:zlib";
 
@@ -42,9 +43,11 @@ import {
   MiniCanvasService,
 } from "../src/service.ts";
 import type { Principal } from "../src/types.ts";
+import { StaticTenantResourceProvider } from "../src/tenant-resources.ts";
 import { MINI_CANVAS_WIDGET_URI } from "../src/widget.ts";
 
 const masterKey = Buffer.alloc(32, 7);
+const tenantId = "local-vault";
 
 class FakeGateway implements NoteGateway {
   readonly notes = new Map<string, NoteSnapshot>();
@@ -131,6 +134,7 @@ function note(path: string, content: string): NoteSnapshot {
 
 const principal: Principal = {
   userId: "tester",
+  tenantId,
   scopes: [
     "notes:read",
     "vault:list",
@@ -142,6 +146,14 @@ const principal: Principal = {
   ],
   allowedPaths: ["Notes", "Assets"],
 };
+
+function tenantResources(
+  gateway: NoteGateway,
+  search: SearchCoordinator,
+  id = tenantId,
+): StaticTenantResourceProvider {
+  return new StaticTenantResourceProvider([[id, { gateway, search }]]);
+}
 
 test("static tokens produce a server-side principal and path boundaries are enforced", async () => {
   const verifier = new StaticTokenVerifier([
@@ -169,13 +181,53 @@ test("static tokens produce a server-side principal and path boundaries are enfo
   await assert.rejects(() => expiredVerifier.verifyAccessToken("c".repeat(32)));
 });
 
+test("static tokens cannot bind one bearer credential to multiple identities", () => {
+  const token = "d".repeat(32);
+  assert.throws(
+    () =>
+      new StaticTokenVerifier([
+        { ...principal, token },
+        {
+          ...principal,
+          token,
+          userId: "other-user",
+          tenantId: "other-tenant",
+        },
+      ]),
+    /不能重复绑定/u,
+  );
+});
+
+test("tenant resources reject a search index from another tenant", () => {
+  const database = new McpDatabase(":memory:");
+  try {
+    const gateway = new FakeGateway();
+    const search = new SearchCoordinator(
+      new SearchIndex(database, new AtRestCrypto(masterKey), "tenant-b"),
+      gateway,
+    );
+    assert.throws(
+      () =>
+        new StaticTenantResourceProvider([
+          ["tenant-a", { gateway, search }],
+        ]),
+      /租户资源与搜索索引不匹配/u,
+    );
+  } finally {
+    database.close();
+  }
+});
+
 test("HTTP MCP accepts complete Markdown requests larger than Express' old 100 KB default", async () => {
   const database = new McpDatabase(":memory:");
   const crypto = new AtRestCrypto(masterKey);
   const gateway = new FakeGateway();
   const search = new SearchCoordinator(new SearchIndex(database, crypto), gateway);
   const drafts = new DraftRepository(database, crypto);
-  const service = new MiniCanvasService({ gateway, drafts, search });
+  const service = new MiniCanvasService({
+    drafts,
+    resources: tenantResources(gateway, search),
+  });
   const token = "h".repeat(32);
   const config: McpConfig = {
     host: "127.0.0.1",
@@ -189,6 +241,7 @@ test("HTTP MCP accepts complete Markdown requests larger than Express' old 100 K
     autoIndex: false,
     caseInsensitivePaths: false,
     draftRetentionDays: 30,
+    defaultTenantId: tenantId,
   };
   const runtime = {
     database,
@@ -235,15 +288,17 @@ test("drafts are encrypted at rest and use optimistic versions", async () => {
     const repository = new DraftRepository(database, new AtRestCrypto(masterKey));
     const original = "绝不能出现在 SQLite 里的草稿明文";
     const draft = repository.create({
+      tenantId,
       userId: "tester",
       path: "Notes/Secret.md",
       content: original,
       baseRevision: "1-a",
     });
     assert.equal(draft.version, 1);
-    assert.equal(repository.get(draft.id, "tester").content, original);
+    assert.equal(repository.get(draft.id, tenantId, "tester").content, original);
     const updated = repository.update({
       id: draft.id,
+      tenantId,
       userId: "tester",
       content: `${original}\n第二版`,
       expectedVersion: 1,
@@ -253,6 +308,7 @@ test("drafts are encrypted at rest and use optimistic versions", async () => {
       () =>
         repository.update({
           id: draft.id,
+          tenantId,
           userId: "tester",
           content: "stale",
           expectedVersion: 1,
@@ -266,10 +322,111 @@ test("drafts are encrypted at rest and use optimistic versions", async () => {
   }
 });
 
+test("v1 database migration preserves encrypted drafts and rebuilds derived search", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mini-canvas-mcp-v1-"));
+  const path = join(directory, "legacy.sqlite");
+  const legacyTenantId = "legacy-vault";
+  const crypto = new AtRestCrypto(masterKey);
+  const id = "11111111-1111-4111-8111-111111111111";
+  const userId = "legacy-user";
+  const draftPath = "Notes/Legacy.md";
+  const content = "# Legacy encrypted draft";
+  const encryptedPath = crypto.encryptDraft(
+    draftPath,
+    `draft\0${userId}\0${id}\0path`,
+  );
+  const encryptedBase = crypto.encryptDraft(
+    content,
+    `draft\0${userId}\0${id}\0base`,
+  );
+  const encryptedCurrent = crypto.encryptDraft(
+    content,
+    `draft\0${userId}\0${id}\0current`,
+  );
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE drafts (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+      path_nonce TEXT NOT NULL, path_ciphertext TEXT NOT NULL, path_tag TEXT NOT NULL,
+      base_revision TEXT NOT NULL, version INTEGER NOT NULL, status TEXT NOT NULL,
+      base_nonce TEXT NOT NULL, base_ciphertext TEXT NOT NULL, base_tag TEXT NOT NULL,
+      current_nonce TEXT NOT NULL, current_ciphertext TEXT NOT NULL, current_tag TEXT NOT NULL,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+      committed_revision TEXT
+    );
+    CREATE TABLE search_documents (
+      id TEXT PRIMARY KEY, path_nonce TEXT NOT NULL, path_ciphertext TEXT NOT NULL,
+      path_tag TEXT NOT NULL, title_nonce TEXT NOT NULL, title_ciphertext TEXT NOT NULL,
+      title_tag TEXT NOT NULL, revision TEXT NOT NULL, mtime INTEGER NOT NULL,
+      size INTEGER NOT NULL, generation TEXT NOT NULL
+    );
+    CREATE TABLE search_terms (
+      document_id TEXT NOT NULL REFERENCES search_documents(id) ON DELETE CASCADE,
+      term_hash TEXT NOT NULL, frequency INTEGER NOT NULL,
+      PRIMARY KEY (document_id, term_hash)
+    );
+    CREATE TABLE service_state (
+      key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL
+    );
+    PRAGMA user_version = 1;
+  `);
+  legacy.prepare(`
+    INSERT INTO drafts VALUES (
+      ?, ?, ?, ?, ?, '1-legacy', 1, 'active',
+      ?, ?, ?, ?, ?, ?, 1, 1, 9999999999999, NULL
+    )
+  `).run(
+    id,
+    userId,
+    encryptedPath.nonce,
+    encryptedPath.ciphertext,
+    encryptedPath.tag,
+    encryptedBase.nonce,
+    encryptedBase.ciphertext,
+    encryptedBase.tag,
+    encryptedCurrent.nonce,
+    encryptedCurrent.ciphertext,
+    encryptedCurrent.tag,
+  );
+  legacy.prepare(`
+    INSERT INTO search_documents VALUES
+      ('legacy-doc', 'n', 'c', 't', 'n', 'c', 't', '1-old', 1, 1, 'old')
+  `).run();
+  legacy.prepare("INSERT INTO service_state VALUES ('search_sequence', '9-old', 1)").run();
+  legacy.close();
+
+  try {
+    const database = new McpDatabase(path, legacyTenantId);
+    const repository = new DraftRepository(database, crypto);
+    assert.equal(
+      repository.get(id, legacyTenantId, userId).content,
+      content,
+    );
+    assert.equal(
+      (database.connection.prepare("PRAGMA user_version").get() as {
+        user_version: number;
+      }).user_version,
+      2,
+    );
+    assert.equal(
+      (database.connection.prepare("SELECT COUNT(*) AS count FROM search_documents").get() as {
+        count: number;
+      }).count,
+      0,
+    );
+    assert.equal(new SearchIndex(database, crypto, legacyTenantId).getSequence(), undefined);
+    database.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("expiring a draft returns the same updated timestamp written to SQLite", () => {
   const database = new McpDatabase(":memory:");
   const repository = new DraftRepository(database, new AtRestCrypto(masterKey));
   const draft = repository.create({
+    tenantId,
     userId: "tester",
     path: "Notes/Expired.md",
     content: "# Expired",
@@ -280,7 +437,7 @@ test("expiring a draft returns the same updated timestamp written to SQLite", ()
     .run(draft.id);
 
   const before = Date.now();
-  const expired = repository.get(draft.id, "tester");
+  const expired = repository.get(draft.id, tenantId, "tester");
   const persisted = database.connection
     .prepare("SELECT updated_at FROM drafts WHERE id = ?")
     .get(draft.id) as { updated_at: number };
@@ -295,6 +452,7 @@ test("expired drafts are marked first and deleted after the recovery window", ()
   const database = new McpDatabase(":memory:");
   const repository = new DraftRepository(database, new AtRestCrypto(masterKey));
   const draft = repository.create({
+    tenantId,
     userId: "tester",
     path: "Notes/Cleanup.md",
     content: "# Cleanup",
@@ -308,13 +466,13 @@ test("expired drafts are marked first and deleted after the recovery window", ()
     markedExpired: 1,
     deleted: 0,
   });
-  assert.equal(repository.get(draft.id, "tester").status, "expired");
+  assert.equal(repository.get(draft.id, tenantId, "tester").status, "expired");
 
   assert.deepEqual(repository.cleanupExpired(now + 1_001, 1_000), {
     markedExpired: 0,
     deleted: 1,
   });
-  assert.throws(() => repository.get(draft.id, "tester"));
+  assert.throws(() => repository.get(draft.id, tenantId, "tester"));
   database.close();
 });
 
@@ -335,6 +493,48 @@ test("search index supports English and CJK without storing note plaintext", () 
   assert.equal(rows.every((row) => /^[a-f0-9]{64}$/u.test(row.term_hash)), true);
   const documents = database.connection.prepare("SELECT * FROM search_documents").all();
   assert.equal(JSON.stringify(documents).includes(content), false);
+  database.close();
+});
+
+test("draft and search storage are isolated by tenant", () => {
+  const database = new McpDatabase(":memory:");
+  const crypto = new AtRestCrypto(masterKey);
+  const drafts = new DraftRepository(database, crypto);
+  const draft = drafts.create({
+    tenantId: "tenant-a",
+    userId: "shared-user",
+    path: "Notes/Shared.md",
+    content: "tenant A draft",
+    baseRevision: "1-a",
+  });
+  assert.equal(
+    drafts.get(draft.id, "tenant-a", "shared-user").content,
+    "tenant A draft",
+  );
+  assert.throws(() => drafts.get(draft.id, "tenant-b", "shared-user"));
+
+  const indexA = new SearchIndex(database, crypto, "tenant-a");
+  const indexB = new SearchIndex(database, crypto, "tenant-b");
+  indexA.upsertNote(note("Notes/Shared.md", "alpha-only"), "a-generation");
+  indexB.upsertNote(note("Notes/Shared.md", "beta-only"), "b-generation");
+  indexA.setSequence("a-sequence");
+  indexB.setSequence("b-sequence");
+
+  const candidateA = indexA.search("alpha-only")[0];
+  const candidateB = indexB.search("beta-only")[0];
+  assert.ok(candidateA);
+  assert.ok(candidateB);
+  assert.notEqual(candidateA.id, candidateB.id);
+  assert.deepEqual(indexA.search("beta-only"), []);
+  assert.deepEqual(indexB.search("alpha-only"), []);
+  assert.equal(indexB.getById(candidateA.id), undefined);
+  assert.equal(indexA.getSequence(), "a-sequence");
+  assert.equal(indexB.getSequence(), "b-sequence");
+
+  indexA.clear();
+  assert.equal(indexA.getSequence(), undefined);
+  assert.equal(indexB.getSequence(), "b-sequence");
+  assert.equal(indexB.search("beta-only").length, 1);
   database.close();
 });
 
@@ -391,9 +591,8 @@ test("service completes draft preview and commit through the gateway", async () 
   gateway.notes.set("Notes/Test.md", note("Notes/Test.md", "# Original"));
   const search = new SearchCoordinator(new SearchIndex(database, crypto), gateway);
   const service = new MiniCanvasService({
-    gateway,
     drafts: new DraftRepository(database, crypto),
-    search,
+    resources: tenantResources(gateway, search),
   });
 
   const draft = await service.createDraft(principal, { path: "Notes/Test.md" });
@@ -427,15 +626,52 @@ test("service completes draft preview and commit through the gateway", async () 
   database.close();
 });
 
+test("service rejects unknown and cross-tenant draft access before using another Vault", async () => {
+  const database = new McpDatabase(":memory:");
+  const crypto = new AtRestCrypto(masterKey);
+  const gatewayA = new FakeGateway();
+  const gatewayB = new FakeGateway();
+  gatewayA.notes.set("Notes/Tenant.md", note("Notes/Tenant.md", "# A"));
+  gatewayB.notes.set("Notes/Tenant.md", note("Notes/Tenant.md", "# B"));
+  const searchA = new SearchCoordinator(
+    new SearchIndex(database, crypto, "tenant-a"),
+    gatewayA,
+  );
+  const searchB = new SearchCoordinator(
+    new SearchIndex(database, crypto, "tenant-b"),
+    gatewayB,
+  );
+  const service = new MiniCanvasService({
+    drafts: new DraftRepository(database, crypto),
+    resources: new StaticTenantResourceProvider([
+      ["tenant-a", { gateway: gatewayA, search: searchA }],
+      ["tenant-b", { gateway: gatewayB, search: searchB }],
+    ]),
+  });
+  const principalA = { ...principal, tenantId: "tenant-a" };
+  const principalB = { ...principal, tenantId: "tenant-b" };
+  const draft = await service.createDraft(principalA, { path: "Notes/Tenant.md" });
+  assert.throws(() => service.getDraft(principalB, draft.id));
+  await assert.rejects(
+    () => service.listEntries({ ...principal, tenantId: "unknown" }, {}),
+    AuthorizationError,
+  );
+  assert.equal((await gatewayA.readNote("Notes/Tenant.md")).content, "# A");
+  assert.equal((await gatewayB.readNote("Notes/Tenant.md")).content, "# B");
+  database.close();
+});
+
 test("service can prefill a visible draft with a complete edit of an existing note", async () => {
   const database = new McpDatabase(":memory:");
   const crypto = new AtRestCrypto(masterKey);
   const gateway = new FakeGateway();
   gateway.notes.set("Notes/Edit.md", note("Notes/Edit.md", "# Original\n"));
   const service = new MiniCanvasService({
-    gateway,
     drafts: new DraftRepository(database, crypto),
-    search: new SearchCoordinator(new SearchIndex(database, crypto), gateway),
+    resources: tenantResources(
+      gateway,
+      new SearchCoordinator(new SearchIndex(database, crypto), gateway),
+    ),
   });
 
   const draft = await service.createDraft(principal, {
@@ -460,9 +696,8 @@ test("service prepares and commits a collision-safe new Markdown note", async ()
   const gateway = new FakeGateway();
   const search = new SearchCoordinator(new SearchIndex(database, crypto), gateway);
   const service = new MiniCanvasService({
-    gateway,
     drafts: new DraftRepository(database, crypto),
-    search,
+    resources: tenantResources(gateway, search),
   });
   const content = "# 二项式定理\n\n$$(a+b)^n=\\sum_{k=0}^{n}\\binom{n}{k}a^{n-k}b^k$$";
 
@@ -500,9 +735,11 @@ test("new-note drafts refuse to replace a note that already exists", async () =>
   const gateway = new FakeGateway();
   gateway.notes.set("Notes/Existing.md", note("Notes/Existing.md", "# Keep me"));
   const service = new MiniCanvasService({
-    gateway,
     drafts: new DraftRepository(database, crypto),
-    search: new SearchCoordinator(new SearchIndex(database, crypto), gateway),
+    resources: tenantResources(
+      gateway,
+      new SearchCoordinator(new SearchIndex(database, crypto), gateway),
+    ),
   });
 
   await assert.rejects(
@@ -525,9 +762,8 @@ test("MCP exposes the Widget resource, annotated tools and encrypted draft launc
   gateway.notes.set("Notes/Test.md", note("Notes/Test.md", "# MCP"));
   const search = new SearchCoordinator(new SearchIndex(database, crypto), gateway);
   const service = new MiniCanvasService({
-    gateway,
     drafts: new DraftRepository(database, crypto),
-    search,
+    resources: tenantResources(gateway, search),
   });
   const server = createMiniCanvasMcpServer(service, principal);
   const client = new Client({ name: "mini-canvas-test", version: "1.0.0" });

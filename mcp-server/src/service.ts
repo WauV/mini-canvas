@@ -10,9 +10,9 @@ import type {
 } from "../../livesync-bridge/src/types.ts";
 import { NEW_NOTE_EXPECTED_REVISION } from "../../livesync-bridge/src/types.ts";
 import { Authorizer } from "./auth.ts";
-import { BridgeHttpError, type NoteGateway } from "./bridge-client.ts";
+import { BridgeHttpError } from "./bridge-client.ts";
 import { DraftConflictError, DraftRepository, DraftStateError } from "./drafts.ts";
-import { createSnippet, SearchCoordinator } from "./search.ts";
+import { createSnippet } from "./search.ts";
 import type {
   CommitPreview,
   DraftSnapshot,
@@ -21,6 +21,7 @@ import type {
   Principal,
   SearchResult,
 } from "./types.ts";
+import type { TenantResourceProvider } from "./tenant-resources.ts";
 
 function lineCount(content: string): number {
   if (!content) return 0;
@@ -44,6 +45,7 @@ export class CommitPreviewRequiredError extends Error {
 }
 
 type CommitConfirmation = {
+  tenantId: string;
   userId: string;
   draftId: string;
   version: number;
@@ -54,21 +56,18 @@ type CommitConfirmation = {
 const COMMIT_CONFIRMATION_TTL_MS = 10 * 60 * 1_000;
 
 export class MiniCanvasService {
-  private readonly gateway: NoteGateway;
   private readonly drafts: DraftRepository;
-  private readonly search: SearchCoordinator;
+  private readonly resources: TenantResourceProvider;
   private readonly authorizer: Authorizer;
   private readonly commitConfirmations = new Map<string, CommitConfirmation>();
 
   constructor(options: {
-    gateway: NoteGateway;
     drafts: DraftRepository;
-    search: SearchCoordinator;
+    resources: TenantResourceProvider;
     authorizer?: Authorizer;
   }) {
-    this.gateway = options.gateway;
     this.drafts = options.drafts;
-    this.search = options.search;
+    this.resources = options.resources;
     this.authorizer = options.authorizer ?? new Authorizer();
   }
 
@@ -77,8 +76,9 @@ export class MiniCanvasService {
     input: ListVaultEntriesInput,
   ): Promise<ListVaultEntriesResult> {
     this.authorizer.requireScope(principal, "vault:list");
+    const { gateway } = this.resources.resolve(principal.tenantId);
     if (input.prefix) this.authorizer.requirePath(principal, input.prefix);
-    const result = await this.gateway.listEntries(input);
+    const result = await gateway.listEntries(input);
     return {
       ...result,
       entries: result.entries.filter((entry) =>
@@ -92,11 +92,12 @@ export class MiniCanvasService {
     rawPath: string,
   ): Promise<AttachmentSnapshot> {
     this.authorizer.requireScope(principal, "attachments:read");
+    const { gateway } = this.resources.resolve(principal.tenantId);
     const path = this.authorizer.requirePath(principal, rawPath);
     if (extname(path).toLowerCase() === ".md") {
       throw new Error("Markdown 笔记必须通过 fetch 或草稿工具读取");
     }
-    return this.gateway.readAttachment(path);
+    return gateway.readAttachment(path);
   }
 
   async createDraft(
@@ -110,13 +111,14 @@ export class MiniCanvasService {
   ): Promise<DraftSnapshot> {
     this.authorizer.requireScope(principal, "notes:read");
     this.authorizer.requireScope(principal, "drafts:write");
+    const { gateway } = this.resources.resolve(principal.tenantId);
     const path = this.authorizer.requirePath(principal, input.path);
     if (extname(path).toLowerCase() !== ".md") {
       throw new Error("草稿只支持 Markdown 笔记（.md）");
     }
     let note: NoteSnapshot;
     try {
-      note = await this.gateway.readNote(path);
+      note = await gateway.readNote(path);
     } catch (error) {
       const missing =
         error instanceof BridgeHttpError &&
@@ -127,6 +129,7 @@ export class MiniCanvasService {
         throw new Error("目标笔记不存在，无法编辑；若要新建请使用新建笔记流程");
       }
       return this.drafts.create({
+        tenantId: principal.tenantId,
         userId: principal.userId,
         path,
         content: input.content ?? "",
@@ -139,6 +142,7 @@ export class MiniCanvasService {
       throw new Error("目标笔记已经存在；请先打开已有笔记再编辑，未覆盖原文");
     }
     return this.drafts.create({
+      tenantId: principal.tenantId,
       userId: principal.userId,
       path: note.path,
       content: input.content ?? note.content,
@@ -150,7 +154,8 @@ export class MiniCanvasService {
 
   getDraft(principal: Principal, draftId: string): DraftSnapshot {
     this.authorizer.requireScope(principal, "drafts:write");
-    const draft = this.drafts.get(draftId, principal.userId);
+    this.resources.resolve(principal.tenantId);
+    const draft = this.drafts.get(draftId, principal.tenantId, principal.userId);
     this.authorizer.requirePath(principal, draft.path);
     return draft;
   }
@@ -160,12 +165,13 @@ export class MiniCanvasService {
     input: { path?: string; status?: DraftStatus; limit?: number } = {},
   ): DraftSummary[] {
     this.authorizer.requireScope(principal, "drafts:write");
+    this.resources.resolve(principal.tenantId);
     const path =
       input.path === undefined
         ? undefined
         : this.authorizer.requirePath(principal, input.path);
     return this.drafts
-      .list(principal.userId, {
+      .list(principal.tenantId, principal.userId, {
         ...input,
         ...(path === undefined ? {} : { path }),
       })
@@ -177,13 +183,16 @@ export class MiniCanvasService {
     rawPath: string,
   ): DraftSnapshot | null {
     this.authorizer.requireScope(principal, "drafts:write");
+    this.resources.resolve(principal.tenantId);
     const path = this.authorizer.requirePath(principal, rawPath);
-    const summary = this.drafts.list(principal.userId, {
+    const summary = this.drafts.list(principal.tenantId, principal.userId, {
       path,
       status: "active",
       limit: 1,
     })[0];
-    return summary ? this.drafts.get(summary.id, principal.userId) : null;
+    return summary
+      ? this.drafts.get(summary.id, principal.tenantId, principal.userId)
+      : null;
   }
 
   updateDraft(
@@ -191,10 +200,16 @@ export class MiniCanvasService {
     input: { draftId: string; content: string; expectedVersion: number },
   ): DraftSnapshot {
     this.authorizer.requireScope(principal, "drafts:write");
-    const current = this.drafts.get(input.draftId, principal.userId);
+    this.resources.resolve(principal.tenantId);
+    const current = this.drafts.get(
+      input.draftId,
+      principal.tenantId,
+      principal.userId,
+    );
     this.authorizer.requirePath(principal, current.path);
     return this.drafts.update({
       id: input.draftId,
+      tenantId: principal.tenantId,
       userId: principal.userId,
       content: input.content,
       expectedVersion: input.expectedVersion,
@@ -206,7 +221,12 @@ export class MiniCanvasService {
     input: { draftId: string; expectedVersion: number },
   ): CommitPreview {
     this.authorizer.requireScope(principal, "drafts:write");
-    const draft = this.drafts.getWithBase(input.draftId, principal.userId);
+    this.resources.resolve(principal.tenantId);
+    const draft = this.drafts.getWithBase(
+      input.draftId,
+      principal.tenantId,
+      principal.userId,
+    );
     this.authorizer.requirePath(principal, draft.path);
     if (draft.status !== "active") throw new DraftStateError(draft.status);
     if (draft.version !== input.expectedVersion) {
@@ -221,6 +241,7 @@ export class MiniCanvasService {
       if (confirmation.expiresAt <= now) this.commitConfirmations.delete(token);
     }
     this.commitConfirmations.set(confirmationToken, {
+      tenantId: principal.tenantId,
       userId: principal.userId,
       draftId: draft.id,
       version: draft.version,
@@ -251,17 +272,22 @@ export class MiniCanvasService {
     },
   ): Promise<{ draft: DraftSnapshot; note: CommitNoteResult }> {
     this.authorizer.requireScope(principal, "drafts:commit");
-    const draft = this.drafts.getWithBase(input.draftId, principal.userId);
+    const { gateway } = this.resources.resolve(principal.tenantId);
+    const draft = this.drafts.getWithBase(
+      input.draftId,
+      principal.tenantId,
+      principal.userId,
+    );
     this.authorizer.requirePath(principal, draft.path);
     if (draft.version !== input.expectedVersion) {
       throw new DraftConflictError(input.expectedVersion, draft.version);
     }
     if (draft.status === "expired") throw new DraftStateError(draft.status);
     if (draft.status === "committed") {
-      const current = await this.gateway.readNote(draft.path);
+      const current = await gateway.readNote(draft.path);
       if (current.content !== draft.content) throw new DraftStateError(draft.status);
       return {
-        draft: this.drafts.get(draft.id, principal.userId),
+        draft: this.drafts.get(draft.id, principal.tenantId, principal.userId),
         note: { ...current, idempotentReplay: true },
       };
     }
@@ -272,6 +298,7 @@ export class MiniCanvasService {
     if (
       !confirmation ||
       confirmation.expiresAt <= Date.now() ||
+      confirmation.tenantId !== principal.tenantId ||
       confirmation.userId !== principal.userId ||
       confirmation.draftId !== draft.id ||
       confirmation.version !== draft.version ||
@@ -280,7 +307,7 @@ export class MiniCanvasService {
       if (confirmation) this.commitConfirmations.delete(input.confirmationToken);
       throw new CommitPreviewRequiredError();
     }
-    const note = await this.gateway.commitNote({
+    const note = await gateway.commitNote({
       path: draft.path,
       content: draft.content,
       expectedRevision: draft.baseRevision,
@@ -289,6 +316,7 @@ export class MiniCanvasService {
     return {
       draft: this.drafts.markCommitted({
         id: draft.id,
+        tenantId: principal.tenantId,
         userId: principal.userId,
         expectedVersion: draft.version,
         revision: note.revision,
@@ -303,15 +331,16 @@ export class MiniCanvasService {
     limit = 10,
   ): Promise<SearchResult[]> {
     this.authorizer.requireScope(principal, "search:read");
-    const health = this.search.health();
+    const { gateway, search } = this.resources.resolve(principal.tenantId);
+    const health = search.health();
     if (health.status === "uninitialized" || health.status === "indexing") {
       throw new SearchNotReadyError();
     }
-    const candidates = this.search.index.search(query, Math.min(limit * 10, 100));
+    const candidates = search.index.search(query, Math.min(limit * 10, 100));
     const results: SearchResult[] = [];
     for (const candidate of candidates) {
       if (!this.authorizer.canAccessPath(principal, candidate.path)) continue;
-      const note = await this.gateway.readNote(candidate.path);
+      const note = await gateway.readNote(candidate.path);
       results.push({
         ...candidate,
         revision: note.revision,
@@ -327,14 +356,16 @@ export class MiniCanvasService {
   async fetchNote(principal: Principal, id: string): Promise<NoteSnapshot & { id: string; title: string }> {
     this.authorizer.requireScope(principal, "search:read");
     this.authorizer.requireScope(principal, "notes:read");
-    const candidate = this.search.index.getById(id);
+    const { gateway, search } = this.resources.resolve(principal.tenantId);
+    const candidate = search.index.getById(id);
     if (!candidate) throw new Error("搜索文档不存在");
     this.authorizer.requirePath(principal, candidate.path);
-    return { ...(await this.gateway.readNote(candidate.path)), id, title: candidate.title };
+    return { ...(await gateway.readNote(candidate.path)), id, title: candidate.title };
   }
 
   async refreshSearch(principal: Principal): Promise<void> {
     this.authorizer.requireScope(principal, "search:refresh");
-    await this.search.refresh(false);
+    const { search } = this.resources.resolve(principal.tenantId);
+    await search.refresh(false);
   }
 }

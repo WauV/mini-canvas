@@ -17,6 +17,7 @@ export type McpConfig = {
   autoIndex: boolean;
   caseInsensitivePaths: boolean;
   draftRetentionDays: number;
+  defaultTenantId: string;
 };
 
 function parseEnvFile(path: string, optional = false): Record<string, string> {
@@ -119,7 +120,7 @@ function requireValue(values: Record<string, string>, key: string): string {
   return value;
 }
 
-function parseTokens(raw: string): StaticTokenRecord[] {
+function parseTokens(raw: string, defaultTenantId: string): StaticTokenRecord[] {
   let value: unknown;
   try {
     value = JSON.parse(raw);
@@ -137,6 +138,7 @@ function parseTokens(raw: string): StaticTokenRecord[] {
     if (
       typeof record.token !== "string" ||
       typeof record.userId !== "string" ||
+      (record.tenantId !== undefined && typeof record.tenantId !== "string") ||
       !Array.isArray(record.scopes) ||
       !record.scopes.every(
         (scope) => typeof scope === "string" && MCP_SCOPES.includes(scope as McpScope),
@@ -154,6 +156,7 @@ function parseTokens(raw: string): StaticTokenRecord[] {
     }
     const principal: Principal = {
       userId: record.userId,
+      tenantId: record.tenantId ?? defaultTenantId,
       scopes: record.scopes as McpScope[],
       allowedPaths: record.allowedPaths,
     };
@@ -203,6 +206,13 @@ export function loadMcpConfig(projectRoot = projectRootFromMcpModule()): McpConf
   ) {
     throw new Error("MINI_CANVAS_MCP_DRAFT_RETENTION_DAYS 必须是 1 到 365 之间的整数");
   }
+  const defaultTenantId = values.MINI_CANVAS_DEFAULT_TENANT_ID?.trim() || "local-vault";
+  if (
+    defaultTenantId.length > 200 ||
+    /[\u0000-\u001f\u007f]/u.test(defaultTenantId)
+  ) {
+    throw new Error("MINI_CANVAS_DEFAULT_TENANT_ID 格式无效");
+  }
   return {
     host,
     port,
@@ -212,12 +222,16 @@ export function loadMcpConfig(projectRoot = projectRootFromMcpModule()): McpConf
     ),
     databasePath,
     masterKey,
-    tokens: parseTokens(requireValue(values, "MINI_CANVAS_MCP_AUTH_JSON")),
+    tokens: parseTokens(
+      requireValue(values, "MINI_CANVAS_MCP_AUTH_JSON"),
+      defaultTenantId,
+    ),
     bridgeUrl,
     bridgeToken: requireValue(values, "MINI_CANVAS_BRIDGE_TOKEN"),
     autoIndex: (values.MINI_CANVAS_MCP_AUTO_INDEX ?? "true").toLowerCase() === "true",
     caseInsensitivePaths:
       (values.MINI_CANVAS_VAULT_CASE_INSENSITIVE ?? "true").toLowerCase() === "true",
     draftRetentionDays,
+    defaultTenantId,
   };
 }

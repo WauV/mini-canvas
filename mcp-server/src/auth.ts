@@ -32,11 +32,20 @@ function normalizeAllowedPath(path: string): string {
 
 export function validatePrincipal(value: Principal): Principal {
   if (!value.userId.trim()) throw new Error("userId 不能为空");
+  const tenantId = value.tenantId.trim();
+  if (
+    !tenantId ||
+    tenantId.length > 200 ||
+    /[\u0000-\u001f\u007f]/u.test(tenantId)
+  ) {
+    throw new Error("tenantId 必须是 1 到 200 个不含控制字符的字符");
+  }
   if (value.scopes.some((scope) => !MCP_SCOPES.includes(scope))) {
     throw new Error(`用户 ${value.userId} 包含未知 scope`);
   }
   return {
     userId: value.userId.trim(),
+    tenantId,
     scopes: [...new Set(value.scopes)],
     allowedPaths: [...new Set(value.allowedPaths.map(normalizeAllowedPath))],
   };
@@ -47,6 +56,9 @@ export class StaticTokenVerifier implements OAuthTokenVerifier {
 
   constructor(records: StaticTokenRecord[]) {
     if (records.length === 0) throw new Error("至少需要一个 MCP Bearer Token");
+    if (new Set(records.map((record) => record.token)).size !== records.length) {
+      throw new Error("MCP Bearer Token 不能重复绑定到多个身份");
+    }
     this.records = records.map((record) => ({
       ...validatePrincipal(record),
       token: record.token,
@@ -80,6 +92,7 @@ export class StaticTokenVerifier implements OAuthTokenVerifier {
     if (!record) throw new AuthenticationError();
     const principal: Principal = {
       userId: record.userId,
+      tenantId: record.tenantId,
       scopes: record.scopes,
       allowedPaths: record.allowedPaths,
     };
@@ -101,6 +114,7 @@ export function principalFromAuth(auth: AuthInfo | undefined): Principal {
   const candidate = value as Partial<Principal>;
   if (
     typeof candidate.userId !== "string" ||
+    typeof candidate.tenantId !== "string" ||
     !Array.isArray(candidate.scopes) ||
     !Array.isArray(candidate.allowedPaths)
   ) {

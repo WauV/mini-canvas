@@ -6,6 +6,7 @@ import { McpDatabase } from "./database.ts";
 import { DraftRepository } from "./drafts.ts";
 import { SearchCoordinator, SearchIndex } from "./search.ts";
 import { MiniCanvasService } from "./service.ts";
+import { StaticTenantResourceProvider } from "./tenant-resources.ts";
 
 export type McpRuntime = {
   database: McpDatabase;
@@ -17,18 +18,22 @@ export type McpRuntime = {
 };
 
 export function createMcpRuntime(config: McpConfig): McpRuntime {
-  const database = new McpDatabase(config.databasePath);
+  const database = new McpDatabase(config.databasePath, config.defaultTenantId);
   const crypto = new AtRestCrypto(config.masterKey, config.caseInsensitivePaths);
   const gateway = new BridgeHttpClient({
     baseUrl: config.bridgeUrl,
     token: config.bridgeToken,
   });
-  const search = new SearchCoordinator(new SearchIndex(database, crypto), gateway);
+  const search = new SearchCoordinator(
+    new SearchIndex(database, crypto, config.defaultTenantId),
+    gateway,
+  );
   const drafts = new DraftRepository(database, crypto);
   const service = new MiniCanvasService({
-    gateway,
     drafts,
-    search,
+    resources: new StaticTenantResourceProvider([
+      [config.defaultTenantId, { gateway, search }],
+    ]),
     authorizer: new Authorizer(config.caseInsensitivePaths),
   });
   return {
